@@ -43,6 +43,8 @@ export interface ConfigValidation {
   label: string;
   /** List mode: number of names, and invalid entries skipped on request. */
   info: { count?: number; skipped?: number };
+  /** A handful of example names these settings could produce. */
+  samples: string[];
 }
 
 const SESSION_KEY = "universal-xbox-session";
@@ -165,7 +167,7 @@ export function CheckerProvider({ children }: { children: ReactNode }) {
   const [lastRealMode, setLastRealMode] = useState<string>(() => (mode === "templates" ? "letters" : mode));
   const [paramsByMode, setParamsByMode] = useState<Record<string, Params>>(readParams);
   const [savedTemplates, setSavedTemplates] = useState<TemplateDef[]>(readTemplates);
-  const [validation, setValidation] = useState<ConfigValidation>({ status: "checking", errors: [], label: "", info: {} });
+  const [validation, setValidation] = useState<ConfigValidation>({ status: "checking", errors: [], label: "", info: {}, samples: [] });
 
   const [rate, setRateState] = useState(() => {
     const n = Number(readStored(RATE_KEY));
@@ -260,7 +262,7 @@ export function CheckerProvider({ children }: { children: ReactNode }) {
   // The server is the only authority on whether settings are valid.
   useEffect(() => {
     if (mode === "templates") {
-      setValidation({ status: "error", errors: ["Choose a template to continue."], label: "", info: {} });
+      setValidation({ status: "error", errors: ["Choose a template to continue."], label: "", info: {}, samples: [] });
       return;
     }
     setValidation((v) => ({ ...v, status: "checking" }));
@@ -273,16 +275,19 @@ export function CheckerProvider({ children }: { children: ReactNode }) {
           body: JSON.stringify({ config: { mode, params } }),
           signal: controller.signal,
         });
-        const d = (await res.json()) as { valid?: boolean; errors?: string[]; label?: string; info?: ConfigValidation["info"] };
+        const d = (await res.json()) as {
+          valid?: boolean; errors?: string[]; label?: string; info?: ConfigValidation["info"]; samples?: string[];
+        };
         setValidation({
           status: d.valid === true ? "ok" : "error",
           errors: Array.isArray(d.errors) ? d.errors : [],
           label: d.label ?? "",
           info: d.info ?? {},
+          samples: Array.isArray(d.samples) ? d.samples : [],
         });
       } catch {
         if (controller.signal.aborted) return;
-        setValidation({ status: "error", errors: ["Could not validate these settings. Is the API reachable?"], label: "", info: {} });
+        setValidation({ status: "error", errors: ["Could not validate these settings. Is the API reachable?"], label: "", info: {}, samples: [] });
       }
     }, 350);
     return () => { clearTimeout(timer); controller.abort(); };

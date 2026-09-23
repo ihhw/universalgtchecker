@@ -444,11 +444,33 @@ router.post("/gamertag/validate", (req, res): void => {
   res.json({ results: names.map((n) => validateXboxGamertag(n)) });
 });
 
+const PREVIEW_SAMPLES = 8;
+const PREVIEW_DRAWS = 40; // draws attempted to fill PREVIEW_SAMPLES with unique names
+
+/** A handful of example names the current settings could produce, for a live preview. */
+function previewSamples(outcome: ReturnType<typeof compileGeneration>): string[] {
+  if (!outcome.ok || !outcome.create) return [];
+  const gen = outcome.create();
+  const seen = new Set<string>();
+  for (let i = 0; i < PREVIEW_DRAWS && seen.size < PREVIEW_SAMPLES; i++) {
+    const s = gen.next();
+    if (s === null) break;
+    seen.add(s);
+  }
+  return [...seen];
+}
+
 // Validate a generation config without starting a search.
 router.post("/gamertag/config/validate", (req, res): void => {
   const config = (req.body as { config?: unknown } | undefined)?.config;
   const outcome = compileGeneration(config);
-  res.json({ valid: outcome.ok, errors: outcome.errors, label: outcome.label, info: outcome.info });
+  res.json({
+    valid: outcome.ok,
+    errors: outcome.errors,
+    label: outcome.label,
+    info: outcome.info,
+    samples: previewSamples(outcome),
+  });
 });
 
 // Start search

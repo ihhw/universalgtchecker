@@ -55,12 +55,26 @@ function ConfigStatus({ v }: { v: ConfigValidation }) {
     );
   }
   return (
-    <p className="mt-3 flex items-center gap-2 text-xs text-muted-foreground" role="status">
-      <span aria-hidden="true" className="h-1.5 w-1.5 rounded-full bg-primary" />
-      Ready
-      {v.info.count !== undefined && ` · ${v.info.count.toLocaleString()} ${v.info.count === 1 ? "name" : "names"}`}
-      {v.info.skipped ? ` · ${v.info.skipped.toLocaleString()} invalid skipped` : ""}
-    </p>
+    <div className="mt-3">
+      <p className="flex items-center gap-2 text-xs text-muted-foreground" role="status">
+        <span aria-hidden="true" className="h-1.5 w-1.5 rounded-full bg-primary" />
+        Ready
+        {v.info.count !== undefined && ` · ${v.info.count.toLocaleString()} ${v.info.count === 1 ? "name" : "names"}`}
+        {v.info.skipped ? ` · ${v.info.skipped.toLocaleString()} invalid skipped` : ""}
+      </p>
+      {v.samples.length > 0 && (
+        <div className="mt-2.5 flex flex-wrap gap-1.5">
+          {v.samples.map((s) => (
+            <span
+              key={s}
+              className="rounded-md border border-border bg-[hsl(var(--well))] px-2 py-1 font-mono text-[11px] tracking-wide text-foreground"
+            >
+              {s}
+            </span>
+          ))}
+        </div>
+      )}
+    </div>
   );
 }
 
