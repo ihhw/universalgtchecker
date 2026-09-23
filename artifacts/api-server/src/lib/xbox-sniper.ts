@@ -1,11 +1,13 @@
 /**
- * Xbox Sniper — watches ONE target gamertag and, when a check definitively
- * reports it available, claims it for the connected Xbox account.
+ * Xbox Sniper — watches one or more target gamertags and, when a check
+ * definitively reports one available, claims it for the connected Xbox
+ * account. Each target runs its own independent watch loop; watching
+ * several targets at once just means several loops running concurrently.
  *
  * The backend run is authoritative: it keeps going whether or not a browser
- * is connected, and its state is persisted to sniper.json so a server restart
- * resumes watching. SSE is only a realtime push of the same snapshot the
- * polling endpoint returns.
+ * is connected, and state for every target is persisted to sniper.json so a
+ * server restart resumes watching. SSE is only a realtime push of the same
+ * snapshots the polling endpoint returns.
  *
  * Availability uses exactly the Checker's mechanism (xbox-availability.ts):
  * CDN primary check, then — with Double Check on — the Xbox reserve policy
@@ -33,6 +35,10 @@ import { warmConnection } from "./xbox-http";
 export const MIN_INTERVAL_MS = 500;
 export const MAX_INTERVAL_MS = 60_000;
 export const DEFAULT_INTERVAL_MS = 1_500;
+/** How many targets may be actively watching (not just stored) at once. */
+export const MAX_TARGETS = 5;
+/** Total target slots kept (active + stopped history); oldest stopped one is evicted beyond this. */
+const MAX_STORED_TARGETS = 20;
 const MAX_EVENTS = 300;
 const WARM_EVERY_MS = 20_000;
 const MAX_BACKOFF_MS = 120_000;
@@ -70,7 +76,10 @@ interface Latency {
   totalMs:           number | null;
 }
 
-export interface SniperSnapshot {
+/** Persisted, per-target state. `id` is the stable slot address (survives stop/restart). */
+interface Persisted {
+  id:             string;
+  /** Guards against a stale async loop from a previous launch of this same id. */
   runId:          string | null;
   state:          SniperState;
   config:         SniperConfig;
@@ -89,12 +98,25 @@ export interface SniperSnapshot {
   stopReason:     string | null;
   latency:        Latency;
   lastClaim:      ClaimRecord | null;
-  account:        ActiveAccountStatus;
   eventSeq:       number;
   events:         SniperEvent[];
+  createdAt:      number;
 }
 
-type Persisted = Omit<SniperSnapshot, "account">;
+export type SniperSnapshot = Persisted & { account: ActiveAccountStatus };
+
+/** Runtime-only state for one target's active loop; never persisted. */
+interface TargetRun {
+  abort:              AbortController | null;
+  warmTimer:          ReturnType<typeof setInterval> | null;
+  availSum:           number;
+  availCount:         number;
+  rateBackoffMs:      number;
+  claimCooldownUntil: number;
+  claimCooldownMs:    number;
+  notifiedFailures:   Set<string>;
+  snap:               Persisted;
+}
 
 const FILE = path.join(process.cwd(), "sniper.json");
 
@@ -102,23 +124,18 @@ function defaultConfig(): SniperConfig {
   return { target: "", intervalMs: DEFAULT_INTERVAL_MS, autoClaim: true, notifications: true, doubleCheck: true };
 }
 
-const s: Persisted = {
-  runId: null, state: "idle", config: defaultConfig(),
-  availability: "unknown", availabilityDetail: null, claim: "waiting", claimReason: null,
-  checks: 0, claimAttempts: 0, lastCheckAt: null, lastClaimAt: null, nextCheckAt: null, backoffUntil: null,
-  startedAt: null, stoppedAt: null, stopReason: null,
-  latency: { availabilityMs: null, avgAvailabilityMs: null, claimMs: null, reactionMs: null, totalMs: null },
-  lastClaim: null, eventSeq: 0, events: [],
-};
+function freshPersisted(id: string): Persisted {
+  return {
+    id, runId: null, state: "idle", config: defaultConfig(),
+    availability: "unknown", availabilityDetail: null, claim: "waiting", claimReason: null,
+    checks: 0, claimAttempts: 0, lastCheckAt: null, lastClaimAt: null, nextCheckAt: null, backoffUntil: null,
+    startedAt: null, stoppedAt: null, stopReason: null,
+    latency: { availabilityMs: null, avgAvailabilityMs: null, claimMs: null, reactionMs: null, totalMs: null },
+    lastClaim: null, eventSeq: 0, events: [], createdAt: Date.now(),
+  };
+}
 
-let abort: AbortController | null = null;
-let warmTimer: ReturnType<typeof setInterval> | null = null;
-let availSum = 0;
-let availCount = 0;
-let rateBackoffMs = 0;
-let claimCooldownUntil = 0;
-let claimCooldownMs = 0;
-const notifiedFailures = new Set<string>();
+const runs = new Map<string, TargetRun>();
 
 // ─── Subscribers (SSE) ────────────────────────────────────────────────────────
 
@@ -137,18 +154,18 @@ function pushSnapshot(): void {
   setImmediate(() => {
     snapshotQueued = false;
     if (subs.size > 0) {
-      const snap = getSniperSnapshot(20);
-      for (const fn of subs) { try { fn("snapshot", snap); } catch { /* dead client */ } }
+      const targets = listSniperSnapshots(20);
+      for (const fn of subs) { try { fn("snapshot", { targets }); } catch { /* dead client */ } }
     }
     schedulePersist();
   });
 }
 
-function log(level: SniperEvent["level"], message: string): void {
-  const e: SniperEvent = { seq: ++s.eventSeq, ts: Date.now(), level, message };
-  s.events.push(e);
-  if (s.events.length > MAX_EVENTS) s.events.splice(0, s.events.length - MAX_EVENTS);
-  for (const fn of subs) { try { fn("event", e); } catch { /* dead client */ } }
+function log(run: TargetRun, level: SniperEvent["level"], message: string): void {
+  const e: SniperEvent = { seq: ++run.snap.eventSeq, ts: Date.now(), level, message };
+  run.snap.events.push(e);
+  if (run.snap.events.length > MAX_EVENTS) run.snap.events.splice(0, run.snap.events.length - MAX_EVENTS);
+  for (const fn of subs) { try { fn("event", { id: run.snap.id, event: e }); } catch { /* dead client */ } }
   pushSnapshot();
 }
 
@@ -166,8 +183,8 @@ function schedulePersist(): void {
 
 function persistNow(): void {
   try {
-    const data: Persisted = { ...s, events: s.events.slice(-100) };
-    fs.writeFileSync(FILE, JSON.stringify(data), { encoding: "utf8", mode: 0o600 });
+    const targets = [...runs.values()].map((r) => ({ ...r.snap, events: r.snap.events.slice(-100) }));
+    fs.writeFileSync(FILE, JSON.stringify({ targets }), { encoding: "utf8", mode: 0o600 });
   } catch (err) {
     logger.warn({ err: err instanceof Error ? err.message : String(err) }, "Could not persist sniper state");
   }
@@ -175,9 +192,31 @@ function persistNow(): void {
 
 function load(): void {
   try {
-    const d = JSON.parse(fs.readFileSync(FILE, "utf8")) as Partial<Persisted>;
-    Object.assign(s, d, { config: { ...defaultConfig(), ...(d.config ?? {}) } });
-    s.events = Array.isArray(d.events) ? d.events : [];
+    const raw = JSON.parse(fs.readFileSync(FILE, "utf8")) as { targets?: Partial<Persisted>[] } | Partial<Persisted>;
+    // Back-compat: a pre-multi-target file was a single Persisted object, not { targets }.
+    const list: Partial<Persisted>[] = Array.isArray((raw as { targets?: unknown }).targets)
+      ? (raw as { targets: Partial<Persisted>[] }).targets
+      : "config" in raw
+        ? [{ ...(raw as Partial<Persisted>), id: crypto.randomUUID() }]
+        : [];
+    for (const t of list) {
+      if (typeof t.id !== "string") continue;
+      // A target that was never actually started (idle, no gamertag) carries no
+      // useful history — dropping it also cleans up the legacy single-sniper
+      // default that pre-multi-target files always contained.
+      if (t.state === "idle" || !t.config?.target) continue;
+      const base = freshPersisted(t.id);
+      const snap: Persisted = {
+        ...base, ...t,
+        config: { ...defaultConfig(), ...(t.config ?? {}) },
+        events: Array.isArray(t.events) ? t.events : [],
+      };
+      runs.set(t.id, {
+        abort: null, warmTimer: null, availSum: 0, availCount: 0,
+        rateBackoffMs: 0, claimCooldownUntil: 0, claimCooldownMs: 0, notifiedFailures: new Set(),
+        snap,
+      });
+    }
   } catch { /* no saved sniper */ }
 }
 
@@ -190,39 +229,40 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
   return wait(Math.max(0, ms), signal);
 }
 
-function isActive(runId: string): boolean {
-  return s.runId === runId && (s.state === "watching" || s.state === "claiming") && !!abort && !abort.signal.aborted;
+function isActive(run: TargetRun, runId: string): boolean {
+  return run.snap.runId === runId && (run.snap.state === "watching" || run.snap.state === "claiming")
+    && !!run.abort && !run.abort.signal.aborted;
 }
 
-function endRun(state: Exclude<SniperState, "watching" | "claiming" | "idle">, reason: string | null): void {
-  s.state = state;
-  s.stoppedAt = Date.now();
-  s.stopReason = reason;
-  s.nextCheckAt = null;
-  abort?.abort();
-  abort = null;
-  if (warmTimer) { clearInterval(warmTimer); warmTimer = null; }
+function endRun(run: TargetRun, state: Exclude<SniperState, "watching" | "claiming" | "idle">, reason: string | null): void {
+  run.snap.state = state;
+  run.snap.stoppedAt = Date.now();
+  run.snap.stopReason = reason;
+  run.snap.nextCheckAt = null;
+  run.abort?.abort();
+  run.abort = null;
+  if (run.warmTimer) { clearInterval(run.warmTimer); run.warmTimer = null; }
   pushSnapshot();
 }
 
-function bumpRateBackoff(serverMs: number | undefined): number {
-  rateBackoffMs = Math.min(MAX_BACKOFF_MS, Math.max(serverMs ?? 0, rateBackoffMs ? rateBackoffMs * 2 : 5_000));
-  s.backoffUntil = Date.now() + rateBackoffMs;
-  return rateBackoffMs;
+function bumpRateBackoff(run: TargetRun, serverMs: number | undefined): number {
+  run.rateBackoffMs = Math.min(MAX_BACKOFF_MS, Math.max(serverMs ?? 0, run.rateBackoffMs ? run.rateBackoffMs * 2 : 5_000));
+  run.snap.backoffUntil = Date.now() + run.rateBackoffMs;
+  return run.rateBackoffMs;
 }
 
 // ─── One check ────────────────────────────────────────────────────────────────
 
 interface CheckOutcome { availability: Availability; detail: string; backoffMs?: number }
 
-async function checkAvailability(target: string, signal: AbortSignal): Promise<CheckOutcome> {
+async function checkAvailability(run: TargetRun, target: string, signal: AbortSignal): Promise<CheckOutcome> {
   const perCheck = AbortSignal.any([signal, AbortSignal.timeout(5_000)]);
   const cdn = await checkViaCDNDetailed(target, perCheck, true);
   if (signal.aborted) return { availability: "unknown", detail: "stopped" };
 
   if (cdn.status === null) {
     if (cdn.httpStatus === 429) {
-      return { availability: "rate_limited", detail: "Xbox CDN returned HTTP 429", backoffMs: bumpRateBackoff(cdn.retryAfterMs) };
+      return { availability: "rate_limited", detail: "Xbox CDN returned HTTP 429", backoffMs: bumpRateBackoff(run, cdn.retryAfterMs) };
     }
     if (cdn.networkError) {
       return { availability: "network_error", detail: cdn.networkError === "timeout" ? "CDN request timed out (5 s)" : "CDN request failed (network)" };
@@ -232,7 +272,7 @@ async function checkAvailability(target: string, signal: AbortSignal): Promise<C
   if (cdn.status === "taken") return { availability: "taken", detail: `CDN HTTP ${cdn.httpStatus}` };
 
   // Primary says available.
-  if (!s.config.doubleCheck) {
+  if (!run.snap.config.doubleCheck) {
     return { availability: "available", detail: `CDN HTTP ${cdn.httpStatus} (primary check only — Double Check off)` };
   }
   const policy = await runEthanPolicyCheck(
@@ -248,7 +288,7 @@ async function checkAvailability(target: string, signal: AbortSignal): Promise<C
     case "banned":
       return { availability: "invalid", detail: `Double Check: Xbox marked the gamertag unacceptable (HTTP ${policy.httpStatus})` };
     case "rate_limited":
-      return { availability: "rate_limited", detail: "Double Check returned HTTP 429", backoffMs: bumpRateBackoff(policy.retryAfterMs) };
+      return { availability: "rate_limited", detail: "Double Check returned HTTP 429", backoffMs: bumpRateBackoff(run, policy.retryAfterMs) };
     case "auth_required":
     case "not_configured":
       return { availability: "auth_error", detail: `Double Check: ${policy.message ?? "authorization required"}` };
@@ -257,127 +297,127 @@ async function checkAvailability(target: string, signal: AbortSignal): Promise<C
   }
 }
 
-async function runClaim(runId: string, target: string, checkStart: number, detectedAt: number): Promise<"stop" | "continue"> {
-  s.state = "claiming";
-  s.claim = "claiming";
-  s.claimReason = null;
-  s.claimAttempts++;
-  s.lastClaimAt = Date.now();
+async function runClaim(run: TargetRun, runId: string, target: string, checkStart: number, detectedAt: number): Promise<"stop" | "continue"> {
+  run.snap.state = "claiming";
+  run.snap.claim = "claiming";
+  run.snap.claimReason = null;
+  run.snap.claimAttempts++;
+  run.snap.lastClaimAt = Date.now();
   const claimStart = now();
-  s.latency.reactionMs = Math.round(claimStart - detectedAt);
-  log("claim", `Claim request sent for ${target}`);
+  run.snap.latency.reactionMs = Math.round(claimStart - detectedAt);
+  log(run, "claim", `Claim request sent for ${target}`);
 
   const r = await claimGamertag(target, { source: "sniper" });
-  s.lastClaim = r;
-  s.latency.claimMs = r.latency.totalMs;
-  s.latency.totalMs = since(checkStart);
-  s.claim = r.state;
-  s.claimReason = r.reason;
-  if (s.runId !== runId) return "stop";
+  run.snap.lastClaim = r;
+  run.snap.latency.claimMs = r.latency.totalMs;
+  run.snap.latency.totalMs = since(checkStart);
+  run.snap.claim = r.state;
+  run.snap.claimReason = r.reason;
+  if (run.snap.runId !== runId) return "stop";
 
-  const timing = `claim ${r.latency.totalMs}ms (reserve ${r.latency.reserveMs ?? "-"}ms, change ${r.latency.changeMs ?? "-"}ms), end-to-end ${s.latency.totalMs}ms`;
+  const timing = `claim ${r.latency.totalMs}ms (reserve ${r.latency.reserveMs ?? "-"}ms, change ${r.latency.changeMs ?? "-"}ms), end-to-end ${run.snap.latency.totalMs}ms`;
 
   if (r.state === "claimed") {
-    log("success", `Claim confirmed by Xbox — ${target} is now this account's gamertag (${r.confirmedBy === "change_response" ? "change response" : "account identity"}; ${timing})`);
-    if (s.config.notifications) void notifyClaimWebhook(r, "Xbox Sniper");
-    endRun("claimed", null);
+    log(run, "success", `Claim confirmed by Xbox — ${target} is now this account's gamertag (${r.confirmedBy === "change_response" ? "change response" : "account identity"}; ${timing})`);
+    if (run.snap.config.notifications) void notifyClaimWebhook(r, "Xbox Sniper");
+    endRun(run, "claimed", null);
     return "stop";
   }
 
   const label = claimStateLabel(r.state);
-  log(r.state === "rate_limited" || r.state === "network_error" ? "warn" : "error", `${label}: ${r.reason ?? "no reason given"}${r.httpStatus ? ` [HTTP ${r.httpStatus}]` : ""} (${timing})`);
+  log(run, r.state === "rate_limited" || r.state === "network_error" ? "warn" : "error", `${label}: ${r.reason ?? "no reason given"}${r.httpStatus ? ` [HTTP ${r.httpStatus}]` : ""} (${timing})`);
   const key = `${r.state}:${r.errorCode ?? ""}`;
-  if (s.config.notifications && !notifiedFailures.has(key)) {
-    notifiedFailures.add(key);
+  if (run.snap.config.notifications && !run.notifiedFailures.has(key)) {
+    run.notifiedFailures.add(key);
     void notifyClaimWebhook(r, "Xbox Sniper");
   }
 
   // Outcomes that retrying can't fix, or where retrying could rename twice.
-  if (r.state === "auth_error") { endRun("error", `Auth error: ${r.reason}`); return "stop"; }
+  if (r.state === "auth_error") { endRun(run, "error", `Auth error: ${r.reason}`); return "stop"; }
   if (r.state === "unknown") {
-    endRun("error", `Claim outcome not confirmed — stopped so the account is never changed twice. ${r.reason ?? ""}`.trim());
+    endRun(run, "error", `Claim outcome not confirmed — stopped so the account is never changed twice. ${r.reason ?? ""}`.trim());
     return "stop";
   }
   if (r.errorCode === "not_allowed" || r.errorCode === "rejected" || r.errorCode === "invalid_gamertag") {
-    endRun("error", r.reason);
+    endRun(run, "error", r.reason);
     return "stop";
   }
   // Stopped by the user while the claim was in flight: report, don't resume.
-  if (s.state !== "claiming") return "stop";
+  if (run.snap.state !== "claiming") return "stop";
 
   // taken / suffix_required / 5xx / network / rate limit / busy: keep watching,
   // but space out further claim attempts so a flapping result can't spam Xbox.
   if (r.state === "rate_limited") {
-    const b = bumpRateBackoff(r.retryAfterMs);
-    claimCooldownUntil = Date.now() + b;
+    const b = bumpRateBackoff(run, r.retryAfterMs);
+    run.claimCooldownUntil = Date.now() + b;
   } else {
-    claimCooldownMs = Math.min(60_000, claimCooldownMs ? claimCooldownMs * 2 : 5_000);
-    claimCooldownUntil = Date.now() + claimCooldownMs;
-    log("info", `Next claim attempt no sooner than ${Math.round(claimCooldownMs / 1000)}s from now`);
+    run.claimCooldownMs = Math.min(60_000, run.claimCooldownMs ? run.claimCooldownMs * 2 : 5_000);
+    run.claimCooldownUntil = Date.now() + run.claimCooldownMs;
+    log(run, "info", `Next claim attempt no sooner than ${Math.round(run.claimCooldownMs / 1000)}s from now`);
   }
-  s.state = "watching";
+  run.snap.state = "watching";
   pushSnapshot();
   return "continue";
 }
 
-async function loop(runId: string, signal: AbortSignal): Promise<void> {
-  const target = s.config.target;
-  while (isActive(runId)) {
+async function loop(run: TargetRun, runId: string, signal: AbortSignal): Promise<void> {
+  const target = run.snap.config.target;
+  while (isActive(run, runId)) {
     const checkStart = now();
-    s.lastCheckAt = Date.now();
-    s.checks++;
-    log("check", `Checking ${target}`);
+    run.snap.lastCheckAt = Date.now();
+    run.snap.checks++;
+    log(run, "check", `Checking ${target}`);
 
     let out: CheckOutcome;
     try {
-      out = await checkAvailability(target, signal);
+      out = await checkAvailability(run, target, signal);
     } catch (err) {
       out = { availability: "unknown", detail: `check error: ${err instanceof Error ? err.message : String(err)}` };
     }
-    if (!isActive(runId)) break;
+    if (!isActive(run, runId)) break;
 
     const availabilityMs = since(checkStart);
-    s.latency.availabilityMs = availabilityMs;
-    availSum += availabilityMs; availCount++;
-    s.latency.avgAvailabilityMs = Math.round(availSum / availCount);
-    s.availability = out.availability;
-    s.availabilityDetail = out.detail;
+    run.snap.latency.availabilityMs = availabilityMs;
+    run.availSum += availabilityMs; run.availCount++;
+    run.snap.latency.avgAvailabilityMs = Math.round(run.availSum / run.availCount);
+    run.snap.availability = out.availability;
+    run.snap.availabilityDetail = out.detail;
 
-    if (out.availability !== "rate_limited") { rateBackoffMs = 0; s.backoffUntil = null; }
-    if (out.availability === "taken") { claimCooldownMs = 0; claimCooldownUntil = 0; }
+    if (out.availability !== "rate_limited") { run.rateBackoffMs = 0; run.snap.backoffUntil = null; }
+    if (out.availability === "taken") { run.claimCooldownMs = 0; run.claimCooldownUntil = 0; }
 
     const tag = `${target} — ${out.availability.replace("_", " ").toUpperCase()}`;
     switch (out.availability) {
-      case "taken":         log("taken", `${tag} (${out.detail}, ${availabilityMs}ms)`); break;
-      case "available":     log("available", `${tag} (${out.detail}, ${availabilityMs}ms)`); break;
-      case "rate_limited":  log("warn", `${tag} — ${out.detail}; backing off ${Math.round((out.backoffMs ?? 0) / 1000)}s`); break;
-      case "auth_error":    log("error", `${tag} — ${out.detail}`); break;
-      default:              log(out.availability === "invalid" ? "error" : "warn", `${tag} (${out.detail}, ${availabilityMs}ms)`);
+      case "taken":         log(run, "taken", `${tag} (${out.detail}, ${availabilityMs}ms)`); break;
+      case "available":     log(run, "available", `${tag} (${out.detail}, ${availabilityMs}ms)`); break;
+      case "rate_limited":  log(run, "warn", `${tag} — ${out.detail}; backing off ${Math.round((out.backoffMs ?? 0) / 1000)}s`); break;
+      case "auth_error":    log(run, "error", `${tag} — ${out.detail}`); break;
+      default:              log(run, out.availability === "invalid" ? "error" : "warn", `${tag} (${out.detail}, ${availabilityMs}ms)`);
     }
 
     if (out.availability === "auth_error") {
-      endRun("error", out.detail);
+      endRun(run, "error", out.detail);
       break;
     }
 
     if (out.availability === "available") {
       const detectedAt = now();
-      if (!s.config.autoClaim) {
-        s.claim = "disabled";
-        s.claimReason = "Auto Claim is off.";
-        log("info", "Auto Claim is off — not claiming");
-      } else if (Date.now() < claimCooldownUntil) {
-        log("info", `Claim cooling down after the previous attempt (${Math.ceil((claimCooldownUntil - Date.now()) / 1000)}s left)`);
+      if (!run.snap.config.autoClaim) {
+        run.snap.claim = "disabled";
+        run.snap.claimReason = "Auto Claim is off.";
+        log(run, "info", "Auto Claim is off — not claiming");
+      } else if (Date.now() < run.claimCooldownUntil) {
+        log(run, "info", `Claim cooling down after the previous attempt (${Math.ceil((run.claimCooldownUntil - Date.now()) / 1000)}s left)`);
       } else {
-        const next = await runClaim(runId, target, checkStart, detectedAt);
+        const next = await runClaim(run, runId, target, checkStart, detectedAt);
         if (next === "stop") break;
       }
     }
 
     // Fixed-rate schedule: the interval counts from the start of this check.
-    let delay = s.config.intervalMs - since(checkStart);
-    if (s.backoffUntil && s.backoffUntil > Date.now()) delay = Math.max(delay, s.backoffUntil - Date.now());
-    s.nextCheckAt = Date.now() + Math.max(0, delay);
+    let delay = run.snap.config.intervalMs - since(checkStart);
+    if (run.snap.backoffUntil && run.snap.backoffUntil > Date.now()) delay = Math.max(delay, run.snap.backoffUntil - Date.now());
+    run.snap.nextCheckAt = Date.now() + Math.max(0, delay);
     pushSnapshot();
     await sleep(delay, signal);
   }
@@ -385,17 +425,21 @@ async function loop(runId: string, signal: AbortSignal): Promise<void> {
 
 // ─── Public API ───────────────────────────────────────────────────────────────
 
-export function getSniperSnapshot(eventLimit = 200): SniperSnapshot {
-  return {
-    ...s,
-    lastClaim: s.lastClaim,
-    events: s.events.slice(-eventLimit),
-    account: getActiveAccountStatus(),
-  };
+export function getSniperSnapshot(id: string, eventLimit = 200): SniperSnapshot | null {
+  const run = runs.get(id);
+  if (!run) return null;
+  return { ...run.snap, events: run.snap.events.slice(-eventLimit), account: getActiveAccountStatus() };
 }
 
-export function eventsAfter(seq: number): SniperEvent[] {
-  return s.events.filter((e) => e.seq > seq);
+export function listSniperSnapshots(eventLimit = 50): SniperSnapshot[] {
+  const account = getActiveAccountStatus();
+  return [...runs.values()]
+    .sort((a, b) => a.snap.createdAt - b.snap.createdAt)
+    .map((run) => ({ ...run.snap, events: run.snap.events.slice(-eventLimit), account }));
+}
+
+export function eventsAfter(id: string, seq: number): SniperEvent[] {
+  return runs.get(id)?.snap.events.filter((e) => e.seq > seq) ?? [];
 }
 
 export function validateSniperConfig(input: Partial<SniperConfig>): { ok: true; config: SniperConfig } | { ok: false; error: string } {
@@ -421,14 +465,33 @@ export function validateSniperConfig(input: Partial<SniperConfig>): { ok: true; 
   };
 }
 
-export type StartResult = { ok: true } | { ok: false; status: number; error: string };
+export type StartResult = { ok: true; id: string } | { ok: false; status: number; error: string };
+
+function activeRuns(): TargetRun[] {
+  return [...runs.values()].filter((r) => r.snap.state === "watching" || r.snap.state === "claiming");
+}
+
+/** Keeps the stored target list bounded by dropping the oldest non-active entry. */
+function evictOldStoppedIfNeeded(): void {
+  if (runs.size <= MAX_STORED_TARGETS) return;
+  const candidates = [...runs.values()]
+    .filter((r) => r.snap.state !== "watching" && r.snap.state !== "claiming")
+    .sort((a, b) => a.snap.createdAt - b.snap.createdAt);
+  const oldest = candidates[0];
+  if (oldest) runs.delete(oldest.snap.id);
+}
 
 export async function startSniper(input: Partial<SniperConfig>): Promise<StartResult> {
-  if (s.state === "watching" || s.state === "claiming") {
-    return { ok: false, status: 409, error: "The sniper is already running. Stop it first." };
-  }
   const v = validateSniperConfig(input);
   if (!v.ok) return { ok: false, status: 400, error: v.error };
+
+  if (activeRuns().length >= MAX_TARGETS) {
+    return { ok: false, status: 409, error: `Cannot watch more than ${MAX_TARGETS} targets at once. Stop another target first.` };
+  }
+  const dupe = activeRuns().find((r) => r.snap.config.target.toUpperCase() === v.config.target.toUpperCase());
+  if (dupe) {
+    return { ok: false, status: 409, error: `Already watching "${v.config.target}".` };
+  }
 
   // Auto Claim and Double Check both need a fully authenticated account;
   // verify the whole chain now instead of discovering a problem at claim time.
@@ -442,78 +505,95 @@ export async function startSniper(input: Partial<SniperConfig>): Promise<StartRe
     }
   }
 
+  const id = crypto.randomUUID();
   const runId = crypto.randomUUID();
-  Object.assign(s, {
-    runId, state: "watching" as SniperState, config: v.config,
-    availability: "unknown" as Availability, availabilityDetail: null,
-    claim: (v.config.autoClaim ? "waiting" : "disabled") as ClaimView, claimReason: null,
-    checks: 0, claimAttempts: 0, lastCheckAt: null, lastClaimAt: null, nextCheckAt: null, backoffUntil: null,
-    startedAt: Date.now(), stoppedAt: null, stopReason: null,
-    latency: { availabilityMs: null, avgAvailabilityMs: null, claimMs: null, reactionMs: null, totalMs: null },
-    lastClaim: null,
-  });
-  availSum = 0; availCount = 0; rateBackoffMs = 0; claimCooldownUntil = 0; claimCooldownMs = 0;
-  notifiedFailures.clear();
-  log("info", `Sniper started — target ${v.config.target}, every ${v.config.intervalMs}ms, Auto Claim ${v.config.autoClaim ? "on" : "off"}, Double Check ${v.config.doubleCheck ? "on" : "off"}`);
-  launch(runId);
-  return { ok: true };
+  const run: TargetRun = {
+    abort: null, warmTimer: null, availSum: 0, availCount: 0,
+    rateBackoffMs: 0, claimCooldownUntil: 0, claimCooldownMs: 0, notifiedFailures: new Set(),
+    snap: {
+      ...freshPersisted(id),
+      runId, state: "watching", config: v.config,
+      claim: v.config.autoClaim ? "waiting" : "disabled",
+      startedAt: Date.now(),
+    },
+  };
+  runs.set(id, run);
+  evictOldStoppedIfNeeded();
+  log(run, "info", `Sniper started — target ${v.config.target}, every ${v.config.intervalMs}ms, Auto Claim ${v.config.autoClaim ? "on" : "off"}, Double Check ${v.config.doubleCheck ? "on" : "off"}`);
+  launch(run, runId);
+  return { ok: true, id };
 }
 
-function launch(runId: string): void {
-  abort = new AbortController();
-  const signal = abort.signal;
+function launch(run: TargetRun, runId: string): void {
+  run.abort = new AbortController();
+  const signal = run.abort.signal;
   // Warm the TLS connections the hot path will use, and keep the claim
   // host's connection alive while watching.
-  if (s.config.autoClaim) {
+  if (run.snap.config.autoClaim) {
     void warmClaimConnection();
-    warmTimer = setInterval(() => { void warmClaimConnection(); }, WARM_EVERY_MS);
-    warmTimer.unref();
+    run.warmTimer = setInterval(() => { void warmClaimConnection(); }, WARM_EVERY_MS);
+    run.warmTimer.unref();
   }
   void warmConnection("https://avatar-ssl.xboxlive.com/");
-  loop(runId, signal).catch((err) => {
+  loop(run, runId, signal).catch((err) => {
     logger.error({ err }, "Sniper loop crashed");
-    if (s.runId === runId) {
-      log("error", `Sniper stopped: internal error (${err instanceof Error ? err.message : String(err)})`);
-      endRun("error", "Internal error");
+    if (run.snap.runId === runId) {
+      log(run, "error", `Sniper stopped: internal error (${err instanceof Error ? err.message : String(err)})`);
+      endRun(run, "error", "Internal error");
     }
   });
 }
 
-export function stopSniper(reason = "Stopped by user"): boolean {
-  if (s.state !== "watching" && s.state !== "claiming") return false;
-  const wasClaiming = s.state === "claiming";
-  log("info", wasClaiming ? `${reason} — the claim already sent to Xbox will still report its outcome` : reason);
-  endRun("stopped", reason);
+export function stopSniper(id: string, reason = "Stopped by user"): boolean {
+  const run = runs.get(id);
+  if (!run || (run.snap.state !== "watching" && run.snap.state !== "claiming")) return false;
+  const wasClaiming = run.snap.state === "claiming";
+  log(run, "info", wasClaiming ? `${reason} — the claim already sent to Xbox will still report its outcome` : reason);
+  endRun(run, "stopped", reason);
   return true;
 }
 
-export function updateSniperSettings(patch: { autoClaim?: boolean; notifications?: boolean }): SniperConfig {
-  if (typeof patch.autoClaim === "boolean" && patch.autoClaim !== s.config.autoClaim) {
-    s.config.autoClaim = patch.autoClaim;
-    if (s.state === "watching") {
-      s.claim = patch.autoClaim ? "waiting" : "disabled";
-      log("info", `Auto Claim turned ${patch.autoClaim ? "on" : "off"}`);
-    }
-  }
-  if (typeof patch.notifications === "boolean" && patch.notifications !== s.config.notifications) {
-    s.config.notifications = patch.notifications;
-    if (s.state === "watching") log("info", `Notifications turned ${patch.notifications ? "on" : "off"}`);
-  }
+/** Stops (if running) and forgets a target entirely. */
+export function removeSniper(id: string): boolean {
+  const run = runs.get(id);
+  if (!run) return false;
+  if (run.snap.state === "watching" || run.snap.state === "claiming") stopSniper(id, "Removed by user");
+  runs.delete(id);
   pushSnapshot();
-  return s.config;
+  return true;
 }
 
-/** Restore persisted state; resume a run that was active when the server stopped. */
+export function updateSniperSettings(id: string, patch: { autoClaim?: boolean; notifications?: boolean }): SniperConfig | null {
+  const run = runs.get(id);
+  if (!run) return null;
+  if (typeof patch.autoClaim === "boolean" && patch.autoClaim !== run.snap.config.autoClaim) {
+    run.snap.config.autoClaim = patch.autoClaim;
+    if (run.snap.state === "watching") {
+      run.snap.claim = patch.autoClaim ? "waiting" : "disabled";
+      log(run, "info", `Auto Claim turned ${patch.autoClaim ? "on" : "off"}`);
+    }
+  }
+  if (typeof patch.notifications === "boolean" && patch.notifications !== run.snap.config.notifications) {
+    run.snap.config.notifications = patch.notifications;
+    if (run.snap.state === "watching") log(run, "info", `Notifications turned ${patch.notifications ? "on" : "off"}`);
+  }
+  pushSnapshot();
+  return run.snap.config;
+}
+
+/** Restore persisted state; resume any runs that were active when the server stopped. */
 export function initSniper(): void {
   load();
-  if (s.state === "claiming") {
-    s.state = "error";
-    s.claim = "unknown";
-    s.stopReason = "The server restarted while a claim was in flight; its outcome was not observed. Check the account's gamertag.";
-    log("error", s.stopReason);
-  } else if (s.state === "watching" && s.runId) {
-    log("info", "Sniper resumed after a server restart");
-    launch(s.runId);
+  for (const run of runs.values()) {
+    if (run.snap.state === "claiming") {
+      run.snap.state = "error";
+      run.snap.claim = "unknown";
+      run.snap.stopReason = "The server restarted while a claim was in flight; its outcome was not observed. Check the account's gamertag.";
+      log(run, "error", run.snap.stopReason);
+    } else if (run.snap.state === "watching" && run.snap.runId) {
+      log(run, "info", "Sniper resumed after a server restart");
+      launch(run, run.snap.runId);
+    }
   }
   // Adding a signal listener replaces Node's default exit, so exit explicitly.
   for (const sig of ["SIGTERM", "SIGINT"] as const) {
@@ -521,6 +601,7 @@ export function initSniper(): void {
   }
 }
 
-export function sniperStats(): { running: boolean; subscribers: number } {
-  return { running: s.state === "watching" || s.state === "claiming", subscribers: subs.size };
+export function sniperStats(): { running: boolean; subscribers: number; active: number } {
+  const active = activeRuns().length;
+  return { running: active > 0, subscribers: subs.size, active };
 }

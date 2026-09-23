@@ -8,10 +8,13 @@ const webhooks = captureWebhooks();
 const sniper = await import("../src/lib/xbox-sniper");
 const store = await import("../src/lib/webhook-store");
 
-after(() => { sniper.stopSniper("test teardown"); mock.server.close(); });
+let currentId: string | null = null;
+
+after(() => { if (currentId) sniper.stopSniper(currentId, "test teardown"); mock.server.close(); });
 
 beforeEach(() => {
-  sniper.stopSniper("reset");
+  for (const t of sniper.listSniperSnapshots()) sniper.removeSniper(t.id);
+  currentId = null;
   mock.state.queues = {};
   mock.state.sticky = {};
   mock.state.taken = new Set(["TAKENTAG", "TARGETTAG"]);
@@ -21,7 +24,15 @@ beforeEach(() => {
   webhooks.length = 0;
 });
 
-const snap = () => sniper.getSniperSnapshot();
+/** Starts a target and remembers its id for snap()/stop() in the rest of the test. */
+async function start(input: Parameters<typeof sniper.startSniper>[0]) {
+  const r = await sniper.startSniper(input);
+  if (r.ok) currentId = r.id;
+  return r;
+}
+
+const snap = () => sniper.getSniperSnapshot(currentId!)!;
+const stop = () => sniper.stopSniper(currentId!);
 const msgs = () => snap().events.map((e) => e.message);
 const calls = (ep: string) => mock.state.log.filter((l) => l.endpoint === ep);
 
@@ -36,11 +47,11 @@ test("config validation: bad tag, content-filtered tag, interval bounds", async 
 });
 
 test("watching a TAKEN tag: real checks, no claims, fixed interval", async () => {
-  const r = await sniper.startSniper({ target: "TargetTag", intervalMs: 500, doubleCheck: true, autoClaim: true, notifications: true });
-  assert.deepEqual(r, { ok: true });
+  const r = await start({ target: "TargetTag", intervalMs: 500, doubleCheck: true, autoClaim: true, notifications: true });
+  assert.equal(r.ok, true);
   assert.equal(snap().state, "watching");
   await until(() => snap().checks >= 3, 5_000);
-  sniper.stopSniper();
+  stop();
   const s = snap();
   assert.equal(s.state, "stopped");
   assert.equal(s.availability, "taken");
@@ -58,7 +69,7 @@ test("watching a TAKEN tag: real checks, no claims, fixed interval", async () =>
 
 test("TAKEN → AVAILABLE (Double Check approved) → CLAIMING → CLAIMED; webhook; stops", async () => {
   store.saveWebhook({ url: WEBHOOK_URL, enabled: true });
-  await sniper.startSniper({ target: "TargetTag", intervalMs: 500 });
+  await start({ target: "TargetTag", intervalMs: 500 });
   await until(() => snap().checks >= 2, 5_000);
   mock.state.taken.delete("TARGETTAG"); // the tag is released
   await until(() => snap().state === "claimed", 5_000);
@@ -90,9 +101,9 @@ test("TAKEN → AVAILABLE (Double Check approved) → CLAIMING → CLAIMED; webh
 test("Double Check says taken (409) → not available, no claim (Double Check preserved)", async () => {
   mock.state.taken.delete("TARGETTAG");
   await control(mock.url, { sticky: { policy: { status: 409, body: {} } } });
-  await sniper.startSniper({ target: "TargetTag", intervalMs: 500 });
+  await start({ target: "TargetTag", intervalMs: 500 });
   await until(() => snap().checks >= 2, 5_000);
-  sniper.stopSniper();
+  stop();
   assert.equal(snap().availability, "taken");
   assert.equal(calls("reserve").length, 0);
   assert.ok(msgs().some((m) => /Double Check says taken \(HTTP 409\)/.test(m)));
@@ -101,7 +112,7 @@ test("Double Check says taken (409) → not available, no claim (Double Check pr
 test("claim fails (taken by someone else) → CLAIM FAILED, keeps watching with a claim cooldown", async () => {
   mock.state.taken.delete("TARGETTAG");
   await control(mock.url, { sticky: { reserve: { status: 409, body: { description: "Gamertag is not available" } } } });
-  await sniper.startSniper({ target: "TargetTag", intervalMs: 500, notifications: true });
+  await start({ target: "TargetTag", intervalMs: 500, notifications: true });
   store.saveWebhook({ url: WEBHOOK_URL, enabled: true });
   await until(() => snap().claim === "claim_failed", 5_000);
   await until(() => snap().checks >= 4, 5_000);
@@ -110,34 +121,34 @@ test("claim fails (taken by someone else) → CLAIM FAILED, keeps watching with 
   assert.equal(s.claimAttempts, 1, "cooldown prevents hammering claims every check");
   assert.ok(msgs().some((m) => /^CLAIM FAILED: Xbox reports "TargetTag" is taken or reserved by someone else \(HTTP 409\)/.test(m)));
   assert.ok(msgs().some((m) => m.startsWith("Claim cooling down")));
-  sniper.stopSniper();
+  stop();
   store.clearWebhook();
 });
 
 test("CDN 429 → RATE LIMITED, backs off per Retry-After, then resumes", async () => {
   await control(mock.url, { queues: { cdn: [{ status: 429, headers: { "Retry-After": "1" } }] } });
-  await sniper.startSniper({ target: "TargetTag", intervalMs: 500 });
+  await start({ target: "TargetTag", intervalMs: 500 });
   await until(() => snap().checks >= 2, 6_000);
   const ts = calls("cdn").map((c) => c.at);
   assert.ok(ts[1]! - ts[0]! >= 950, `backoff honoured (${ts[1]! - ts[0]!}ms)`);
   assert.ok(msgs().some((m) => /RATE LIMITED — Xbox CDN returned HTTP 429; backing off/.test(m)));
   await until(() => snap().availability === "taken", 3_000);
-  sniper.stopSniper();
+  stop();
 });
 
 test("network failure on a check → NETWORK ERROR logged, sniper keeps watching", async () => {
   await control(mock.url, { queues: { cdn: [{ drop: true }] } });
-  await sniper.startSniper({ target: "TargetTag", intervalMs: 500 });
+  await start({ target: "TargetTag", intervalMs: 500 });
   await until(() => snap().checks >= 2 && snap().availability === "taken", 5_000);
   assert.ok(msgs().some((m) => /NETWORK ERROR \(CDN request failed \(network\)/.test(m)));
   assert.equal(snap().state, "watching");
-  sniper.stopSniper();
+  stop();
 });
 
 test("claim auth error → sniper stops with the real reason", async () => {
   mock.state.taken.delete("TARGETTAG");
   await control(mock.url, { sticky: { reserve: { status: 403, body: { description: "Account restricted" } } } });
-  await sniper.startSniper({ target: "TargetTag", intervalMs: 500 });
+  await start({ target: "TargetTag", intervalMs: 500 });
   await until(() => snap().state === "error", 5_000);
   assert.equal(snap().claim, "auth_error");
   assert.match(snap().stopReason ?? "", /Account restricted/);
@@ -145,12 +156,12 @@ test("claim auth error → sniper stops with the real reason", async () => {
 
 test("Auto Claim OFF → reports AVAILABLE but never claims", async () => {
   mock.state.taken.delete("TARGETTAG");
-  await sniper.startSniper({ target: "TargetTag", intervalMs: 500, autoClaim: false });
+  await start({ target: "TargetTag", intervalMs: 500, autoClaim: false });
   await until(() => snap().availability === "available", 5_000);
   await until(() => snap().checks >= 2, 5_000);
   assert.equal(snap().claim, "disabled");
   assert.equal(calls("reserve").length, 0);
-  sniper.stopSniper();
+  stop();
 });
 
 test("account not ready → start refused with the reason", async () => {
@@ -166,12 +177,72 @@ test("account not ready → start refused with the reason", async () => {
 });
 
 test("state is persisted to sniper.json (0600) without secrets", async () => {
-  await sniper.startSniper({ target: "TargetTag", intervalMs: 500 });
+  await start({ target: "TargetTag", intervalMs: 500 });
   await until(() => snap().checks >= 1, 3_000);
-  sniper.stopSniper();
-  await until(() => fs.existsSync("sniper.json") && JSON.parse(fs.readFileSync("sniper.json", "utf8")).state === "stopped", 3_000);
+  stop();
+  await until(() => fs.existsSync("sniper.json") && JSON.parse(fs.readFileSync("sniper.json", "utf8")).targets?.[0]?.state === "stopped", 3_000);
   const raw = fs.readFileSync("sniper.json", "utf8");
   assert.equal(fs.statSync("sniper.json").mode & 0o777, 0o600);
   assert.ok(!/xsts\||rt-|ms-at-|xbl-user-/.test(raw));
-  assert.equal(JSON.parse(raw).config.target, "TargetTag");
+  assert.equal(JSON.parse(raw).targets[0].config.target, "TargetTag");
+});
+
+// ─── Multi-target ───────────────────────────────────────────────────────────
+
+test("two targets watch concurrently, independently, and can claim independently", async () => {
+  mock.state.taken = new Set(["TAKENTAG"]); // TargetTag and SecondTag both start free
+  const r1 = await sniper.startSniper({ target: "TargetTag", intervalMs: 500, doubleCheck: false });
+  const r2 = await sniper.startSniper({ target: "SecondTag", intervalMs: 500, doubleCheck: false });
+  assert.equal(r1.ok, true);
+  assert.equal(r2.ok, true);
+  if (!r1.ok || !r2.ok) return;
+
+  await until(() => (sniper.getSniperSnapshot(r1.id)?.checks ?? 0) >= 1 && (sniper.getSniperSnapshot(r2.id)?.checks ?? 0) >= 1, 5_000);
+
+  const targets = sniper.listSniperSnapshots();
+  assert.equal(targets.length, 2);
+  assert.deepEqual(new Set(targets.map((t) => t.config.target)), new Set(["TargetTag", "SecondTag"]));
+
+  // Claiming one doesn't touch the other's state.
+  await until(() => sniper.getSniperSnapshot(r1.id)?.state === "claimed", 5_000);
+  assert.equal(sniper.getSniperSnapshot(r2.id)?.state, "watching");
+  assert.equal(mock.state.gamertag, "TargetTag");
+
+  sniper.stopSniper(r2.id);
+  currentId = null;
+});
+
+test("starting a target already being watched is refused", async () => {
+  mock.state.taken.delete("TARGETTAG");
+  const r1 = await start({ target: "TargetTag", intervalMs: 500, autoClaim: false });
+  assert.equal(r1.ok, true);
+  const r2 = await sniper.startSniper({ target: "targettag", intervalMs: 500 }); // case-insensitive match
+  assert.equal(r2.ok, false);
+  if (!r2.ok) assert.match(r2.error, /Already watching/);
+  stop();
+});
+
+test("removing a target stops it and drops it from the list", async () => {
+  await start({ target: "TargetTag", intervalMs: 500 });
+  await until(() => snap().checks >= 1, 3_000);
+  const id = currentId!;
+  const removed = sniper.removeSniper(id);
+  assert.equal(removed, true);
+  assert.equal(sniper.getSniperSnapshot(id), null);
+  assert.equal(sniper.listSniperSnapshots().find((t) => t.id === id), undefined);
+  currentId = null;
+});
+
+test("loading a legacy pre-multi-target sniper.json (never-started, empty target) creates no phantom target", async () => {
+  const before = sniper.listSniperSnapshots().length;
+  fs.writeFileSync("sniper.json", JSON.stringify({
+    runId: null, state: "idle", config: { target: "", intervalMs: 1500, autoClaim: true, notifications: true, doubleCheck: true },
+    availability: "unknown", availabilityDetail: null, claim: "waiting", claimReason: null,
+    checks: 0, claimAttempts: 0, lastCheckAt: null, lastClaimAt: null, nextCheckAt: null, backoffUntil: null,
+    startedAt: null, stoppedAt: null, stopReason: null,
+    latency: { availabilityMs: null, avgAvailabilityMs: null, claimMs: null, reactionMs: null, totalMs: null },
+    lastClaim: null, eventSeq: 0, events: [],
+  }), { mode: 0o600 });
+  sniper.initSniper();
+  assert.equal(sniper.listSniperSnapshots().length, before, "a never-started legacy sniper should not appear as a target");
 });

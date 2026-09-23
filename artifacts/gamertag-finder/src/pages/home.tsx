@@ -1,7 +1,7 @@
 import { Link } from "wouter";
 import { Panel, PageHeader, Eyebrow } from "@/components/panel";
 import { useChecker } from "@/state/checker";
-import { useSniper } from "@/hooks/use-sniper";
+import { useSniperTargets } from "@/hooks/use-sniper";
 import { useSystemStatus } from "@/hooks/use-system-status";
 import { cn } from "@/lib/utils";
 
@@ -32,7 +32,7 @@ function StatCard({ label, value, detail, tone = "default", href }: {
 
 export default function HomePage() {
   const { isAuthed, accountReady, auth, isRunning, isPaused, snapshot, hits, feedConnected, sessionId } = useChecker();
-  const { snapshot: sniper } = useSniper();
+  const { targets: sniperTargets } = useSniperTargets();
   const { rows: statusRows, apiReachable } = useSystemStatus();
 
   const servicesDown = statusRows.filter((s) => s.state === "offline").length;
@@ -46,12 +46,13 @@ export default function HomePage() {
     ? `${snapshot.attempts.toLocaleString()} checked · ${snapshot.found} found`
     : "No active search";
 
-  const sniperLabel = sniper?.state
-    ? sniper.state.charAt(0).toUpperCase() + sniper.state.slice(1)
-    : "Idle";
-  const sniperDetail = sniper?.config.target
-    ? `Target: ${sniper.config.target}`
-    : "No target set";
+  const sniperActive = sniperTargets.filter((t) => t.state === "watching" || t.state === "claiming");
+  const sniperLabel = sniperActive.length > 0
+    ? `Watching ${sniperActive.length}`
+    : sniperTargets.length > 0 ? "Idle" : "No targets";
+  const sniperDetail = sniperActive.length > 0
+    ? sniperActive.map((t) => t.config.target).join(", ")
+    : "No targets watching";
 
   const accountLabel = !isAuthed ? "Not connected" : accountReady ? "Ready" : "Needs attention";
   const accountDetail = isAuthed
@@ -93,7 +94,7 @@ export default function HomePage() {
           label="Sniper"
           value={sniperLabel}
           detail={sniperDetail}
-          tone={sniper?.state === "watching" || sniper?.state === "claiming" ? "good" : "muted"}
+          tone={sniperActive.length > 0 ? "good" : "muted"}
           href="/xbox/sniper"
         />
         <StatCard
