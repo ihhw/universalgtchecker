@@ -46,6 +46,7 @@ import { validateXboxGamertag } from "./xbox-validation";
 import { getClaimContext, refreshActiveIdentity } from "./xbox-auth";
 import { fastFetch, retryAfterMs, warmConnection } from "./xbox-http";
 import { getWebhookTarget, sendWebhookPayload } from "./webhook-store";
+import { recordClaim } from "./stats";
 
 const GAMERTAG_HOST = "https://gamertag.xboxlive.com";
 const RESERVE_URL   = `${GAMERTAG_HOST}/gamertags/reserve`;
@@ -251,6 +252,7 @@ export async function claimGamertag(
   ): ClaimRecord => {
     Object.assign(record, patch, { state, finishedAt: Date.now() });
     record.latency.totalMs = ms(t0);
+    recordClaim(state === "claimed");
     logger.info(
       { gamertag, source: record.source, state, errorCode: record.errorCode, step: record.step, httpStatus: record.httpStatus, totalMs: record.latency.totalMs },
       "Gamertag claim finished",

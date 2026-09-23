@@ -7,6 +7,7 @@ import settingsRouter from "./settings";
 import statusRouter   from "./status";
 import botRouter      from "./bot";
 import sniperRouter   from "./sniper";
+import analyticsRouter from "./analytics";
 
 const router: IRouter = Router();
 
@@ -18,5 +19,6 @@ router.use(settingsRouter);
 router.use(statusRouter);
 router.use(botRouter);
 router.use(sniperRouter);
+router.use(analyticsRouter);
 
 export default router;

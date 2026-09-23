@@ -31,6 +31,7 @@ import {
 } from "./xbox-claim";
 import { getActiveAccountStatus, verifyActiveAccount, type ActiveAccountStatus } from "./xbox-auth";
 import { warmConnection } from "./xbox-http";
+import { recordCheck, type CheckStatus } from "./stats";
 
 export const MIN_INTERVAL_MS = 500;
 export const MAX_INTERVAL_MS = 60_000;
@@ -385,6 +386,11 @@ async function loop(run: TargetRun, runId: string, signal: AbortSignal): Promise
 
     if (out.availability !== "rate_limited") { run.rateBackoffMs = 0; run.snap.backoffUntil = null; }
     if (out.availability === "taken") { run.claimCooldownMs = 0; run.claimCooldownUntil = 0; }
+
+    // The dashboard's tri-state check count mirrors the Checker's: anything
+    // that isn't a definitive available/taken counts as "unknown".
+    const statTri: CheckStatus = out.availability === "available" || out.availability === "taken" ? out.availability : "unknown";
+    recordCheck(statTri);
 
     const tag = `${target} — ${out.availability.replace("_", " ").toUpperCase()}`;
     switch (out.availability) {

@@ -28,6 +28,20 @@ async function copy(text: string) {
   }
 }
 
+function exportHitsCsv(hits: { username: string; format: string; ts: number; policy?: string }[], claimStatus: (u: string) => ClaimStatus) {
+  const header = ["gamertag", "format", "found_at", "double_check", "claim_status"];
+  const rows = hits.map((h) => [
+    h.username, h.format, new Date(h.ts).toISOString(), h.policy === "approved" ? "approved" : "", claimStatus(h.username),
+  ].map((v) => `"${String(v).replace(/"/g, '""')}"`).join(","));
+  const csv = [header.join(","), ...rows].join("\n");
+  const url = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "hits.csv";
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
 const btn =
   "rounded-lg border border-border px-3 py-1.5 font-mono text-[12px] text-muted-foreground transition-colors hover:border-primary/40 hover:text-foreground disabled:cursor-default disabled:opacity-50";
 
@@ -54,7 +68,19 @@ export default function HitsPage() {
       <PageHeader title="Hits" />
       <div className="space-y-4">
         <Panel>
-          <Eyebrow>Found</Eyebrow>
+          <div className="flex items-center justify-between">
+            <Eyebrow>Found</Eyebrow>
+            {hits.length > 0 && (
+              <button
+                type="button"
+                className={cn(btn, "inline-flex items-center gap-1.5")}
+                onClick={() => exportHitsCsv(hits, (u) => c.claimStatuses.get(u.toUpperCase()) ?? "idle")}
+              >
+                <Download className="h-3.5 w-3.5" />
+                Export CSV
+              </button>
+            )}
+          </div>
           {hits.length === 0 ? (
             <p className="mt-4 rounded-lg border border-border bg-[hsl(var(--well))] px-4 py-10 text-center text-sm text-muted-foreground">
               No hits yet

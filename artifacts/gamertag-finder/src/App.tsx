@@ -1,3 +1,4 @@
+import { lazy, Suspense } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { Route, Switch, Router as WouterRouter } from "wouter";
 import { Toaster } from "sonner";
@@ -12,6 +13,10 @@ import StatusPage from "@/pages/status";
 import SettingsPage from "@/pages/settings";
 import NotFound from "@/pages/not-found";
 
+// Recharts is a heavy dependency used only here, so it's kept out of the
+// main bundle and fetched on demand when the page is actually visited.
+const AnalyticsPage = lazy(() => import("@/pages/analytics"));
+
 const queryClient = new QueryClient();
 
 function Routes() {
@@ -21,6 +26,11 @@ function Routes() {
       <Route path="/xbox" component={XboxPage} />
       <Route path="/xbox/sniper" component={SniperPage} />
       <Route path="/hits" component={HitsPage} />
+      <Route path="/analytics">
+        <Suspense fallback={<p className="py-10 text-center text-sm text-muted-foreground">Loading…</p>}>
+          <AnalyticsPage />
+        </Suspense>
+      </Route>
       <Route path="/activity" component={ActivityPage} />
       <Route path="/status" component={StatusPage} />
       <Route path="/settings" component={SettingsPage} />

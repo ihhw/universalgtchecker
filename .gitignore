@@ -61,3 +61,7 @@ artifacts/api-server/webhook.json
 # Xbox Sniper persisted state (runtime)
 artifacts/api-server/sniper.json
 sniper.json
+
+# Analytics counters persisted state (runtime)
+artifacts/api-server/stats.json
+stats.json

@@ -8,6 +8,7 @@ import router from "./routes";
 import { logger } from "./lib/logger";
 import { preWarmXboxAuth } from "./lib/xbox-auth";
 import { initSniper } from "./lib/xbox-sniper";
+import { initStats } from "./lib/stats";
 
 const app: Express = express();
 
@@ -69,5 +70,6 @@ preWarmXboxAuth();
 
 // Restore the sniper; a run that was watching when the server stopped resumes.
 initSniper();
+initStats();
 
 export default app;

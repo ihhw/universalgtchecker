@@ -1,4 +1,5 @@
 import type { Response } from "express";
+import { recordCheck } from "./stats";
 
 /**
  * Bounded, in-memory activity log of real checker events.
@@ -37,6 +38,7 @@ export function pushActivity(input: Omit<ActivityEvent, "id" | "ts">): ActivityE
   const event: ActivityEvent = { id: nextId++, ts: Date.now(), ...input };
   events.push(event);
   if (events.length > MAX_EVENTS) events.splice(0, events.length - MAX_EVENTS);
+  recordCheck(event.status);
   if (event.status === "available" && event.alertable) {
     hits.push(event);
     if (hits.length > MAX_HITS) hits.splice(0, hits.length - MAX_HITS);
