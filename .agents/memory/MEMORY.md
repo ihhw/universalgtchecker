@@ -1,5 +1,5 @@
 - [Xbox Gamertag Checker Architecture](gamertag-checker-arch.md) — Node.js concurrent workers (not Python asyncio); N workers × 1 check/sec = N CPS; CDN fallback for unauthenticated checks
-- [Auto-Claim Endpoint](gamertag-autoclaim.md) — PUT to gamertag.xboxlive.com/gamertags/{gt}; Xbox API may reject or need XUID; userHash optional; clear error shapes in response
+- [Auto-Claim Endpoint](gamertag-autoclaim.md) — reserve → change on gamertag.xboxlive.com with the http://xboxlive.com XSTS token + XUID; CLAIMED only when Xbox confirms; server-side only
 - [Generated Type Files](gamertag-codegen.md) — Orval-generated files manually patched (not regenerated); all four places must stay in sync: openapi.yaml, api-zod generated, api-client-react schemas, api-client-react api.ts
 - [Xbox Policy Reservation](xbox-policy-reservation.md) — Ethan’s reserve check can use the signed-in account XUID as reservationId; no separate browser token flow is needed
 - [Discord Command Permissions](discord-command-permissions.md) — slash commands work with default intents; legacy ! commands require Discord Message Content Intent

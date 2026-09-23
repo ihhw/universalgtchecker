@@ -1,13 +1,32 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 
+/**
+ * Readiness of the account that performs claims, as verified by the server
+ * (Microsoft → Xbox Live → XSTS → XUID). Display-safe: masked email and
+ * XUID only; tokens never leave the server.
+ */
+export interface XboxAccountStatus {
+  connected:   boolean;
+  ready:       boolean;
+  stage:       "none" | "microsoft" | "xbox_live" | "xsts" | "xuid" | "ready";
+  reason:      string | null;
+  code:        string | null;
+  checkedAt:   number | null;
+  maskedEmail: string | null;
+  gamertag:    string | null;
+  maskedXuid:  string | null;
+}
+
 export interface AuthStatus {
   authenticated: boolean;
   xstsReady:     boolean;
+  account?:      XboxAccountStatus;
   deviceCode: {
     userCode:        string;
     verificationUri: string;
     status:          "pending" | "authorized" | "expired" | "error";
     expiresAt:       number;
+    error?:          string;
   } | null;
 }
 
@@ -40,10 +59,11 @@ export function useXboxAuth() {
     };
   }, [fetchStatus]);
 
-  // Fast poll (3 s) while a device code flow is pending so we catch the
-  // moment the user signs in without delay.
+  // Fast poll (3 s) while a device code flow is pending, and while a fresh
+  // sign-in is still resolving Xbox Live/XSTS, so readiness shows promptly.
   useEffect(() => {
-    const isPending = status?.deviceCode?.status === "pending";
+    const isPending = status?.deviceCode?.status === "pending" ||
+      (status?.authenticated === true && status.account?.checkedAt === null);
     if (isPending && !fastPollRef.current) {
       fastPollRef.current = setInterval(fetchStatus, 3_000);
     } else if (!isPending && fastPollRef.current) {
@@ -72,6 +92,20 @@ export function useXboxAuth() {
     }
   }, []);
 
+  /** Asks the server to run the full auth chain now. */
+  const verify = useCallback(async () => {
+    setLoading(true);
+    try {
+      const res = await fetch(`${BASE}/api/auth/xbox/verify`, { method: "POST" });
+      if (res.ok) {
+        const d = await res.json() as Pick<AuthStatus, "authenticated" | "xstsReady" | "account">;
+        setStatus((prev) => ({ deviceCode: prev?.deviceCode ?? null, ...d }));
+      }
+    } catch { /* ignore */ } finally {
+      setLoading(false);
+    }
+  }, []);
+
   const logout = useCallback(async () => {
     setLoading(true);
     try {
@@ -82,5 +116,5 @@ export function useXboxAuth() {
     }
   }, [fetchStatus]);
 
-  return { status, loading, startAuth, logout, refetch: fetchStatus };
+  return { status, loading, startAuth, logout, verify, refetch: fetchStatus };
 }

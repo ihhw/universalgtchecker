@@ -164,7 +164,7 @@ export default function XboxPage() {
               className="range mt-2"
             />
 
-            <div className="mt-4">
+            <div className="mt-4 divide-y divide-border/60">
               <Option
                 id="double-check"
                 title="Double Check"
@@ -173,6 +173,21 @@ export default function XboxPage() {
                 onChange={(v) => {
                   if (v && !c.isAuthed) { c.setConnectOpen(true); return; }
                   c.setDoubleCheck(v);
+                }}
+                disabled={c.isRunning}
+              />
+              <Option
+                id="auto-claim"
+                title="Auto Claim"
+                description={
+                  c.autoClaim && c.isAuthed && !c.accountReady
+                    ? `The connected Xbox account can't claim yet: ${c.auth.status?.account?.reason ?? "not verified"}`
+                    : "The server claims the first confirmed hit for the connected Xbox account, even with this tab closed. Only an Xbox-confirmed claim is shown as Claimed."
+                }
+                checked={c.autoClaim && c.isAuthed}
+                onChange={(v) => {
+                  if (v && !c.isAuthed) { c.setConnectOpen(true); return; }
+                  c.setAutoClaim(v);
                 }}
                 disabled={c.isRunning}
               />

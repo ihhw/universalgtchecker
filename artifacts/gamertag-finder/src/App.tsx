@@ -4,6 +4,7 @@ import { Toaster } from "sonner";
 import { AppShell } from "@/components/app-shell";
 import { CheckerProvider } from "@/state/checker";
 import XboxPage from "@/pages/xbox";
+import SniperPage from "@/pages/sniper";
 import HitsPage from "@/pages/hits";
 import ActivityPage from "@/pages/activity";
 import StatusPage from "@/pages/status";
@@ -19,6 +20,7 @@ function Routes() {
         <Redirect to="/xbox" />
       </Route>
       <Route path="/xbox" component={XboxPage} />
+      <Route path="/xbox/sniper" component={SniperPage} />
       <Route path="/hits" component={HitsPage} />
       <Route path="/activity" component={ActivityPage} />
       <Route path="/status" component={StatusPage} />

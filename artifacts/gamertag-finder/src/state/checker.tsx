@@ -13,9 +13,29 @@ import { useActivityFeed } from "@/hooks/use-activity-feed";
 import { useSessionSnapshot, type SessionSnapshot } from "@/hooks/use-session-snapshot";
 import { useXboxAuth } from "@/hooks/use-xbox-auth";
 
+/**
+ * Claim states come from the backend claim engine. "claimed" is only ever
+ * set when Xbox confirmed the exact gamertag for the connected account.
+ */
 export type ClaimStatus =
-  | "idle" | "claiming" | "claimed" | "error"
-  | "rate_limited" | "auth_failed" | "rejected" | "auth_required";
+  | "idle" | "claiming" | "claimed" | "claim_failed"
+  | "auth_error" | "rate_limited" | "network_error" | "unknown";
+
+/** A claim record as reported by GET /api/gamertag/claims. */
+export interface ClaimRecord {
+  id: number;
+  gamertag: string;
+  source: "manual" | "checker" | "sniper";
+  sessionId?: string;
+  state: Exclude<ClaimStatus, "idle">;
+  errorCode: string | null;
+  reason: string | null;
+  httpStatus: number | null;
+  confirmedBy: "change_response" | "xsts_identity" | null;
+  startedAt: number;
+  finishedAt: number | null;
+  latency: { totalMs: number | null; reserveMs: number | null; changeMs: number | null };
+}
 
 export interface ConfigValidation {
   status: "checking" | "ok" | "error";
@@ -76,10 +96,13 @@ interface CheckerContextValue {
   unsave: (tag: string) => void;
   exportSaved: () => void;
   claimStatuses: Map<string, ClaimStatus>;
+  claimRecords: Map<string, ClaimRecord>;
   claim: (tag: string) => Promise<void>;
   // xbox account
   auth: ReturnType<typeof useXboxAuth>;
   isAuthed: boolean;
+  /** Full chain verified server-side: the account can claim. */
+  accountReady: boolean;
   connectOpen: boolean;
   setConnectOpen: (open: boolean) => void;
 }
@@ -90,28 +113,6 @@ export function useChecker(): CheckerContextValue {
   const ctx = useContext(CheckerContext);
   if (!ctx) throw new Error("useChecker must be used inside CheckerProvider");
   return ctx;
-}
-
-/**
- * The claim API returns several specific error codes. Collapse them into the
- * few states the UI knows how to render, so a button label is never blank.
- */
-function toClaimStatus(code: string | undefined): ClaimStatus {
-  switch (code) {
-    case "rate_limited":
-    case "auth_failed":
-    case "auth_required":
-    case "rejected":
-      return code;
-    case "invalid_gamertag":
-    case "taken":
-    case "suffix_required":
-    case "suffix_assigned":
-    case "not_found":
-      return "rejected";
-    default:
-      return "error";
-  }
 }
 
 function readSaved(): string[] {
@@ -178,16 +179,18 @@ export function CheckerProvider({ children }: { children: ReactNode }) {
   });
   const [starting, setStarting] = useState(false);
   const startingRef = useRef(false);
-  const claimFloor = useRef(0);
   const claimsInFlight = useRef(new Set<string>());
 
   const [saved, setSaved] = useState<string[]>(readSaved);
-  const [claimStatuses, setClaimStatuses] = useState<Map<string, ClaimStatus>>(new Map());
+  // Latest backend claim record per gamertag (upper-cased key).
+  const [claimRecords, setClaimRecords] = useState<Map<string, ClaimRecord>>(new Map());
+  const [pendingClaims, setPendingClaims] = useState<Set<string>>(new Set());
   const [connectOpen, setConnectOpen] = useState(false);
 
   const auth = useXboxAuth();
   const isAuthed = auth.status?.authenticated === true;
-  const { events: feed, hits, connected: feedConnected, clear: clearFeed, latestEventId } = useActivityFeed();
+  const accountReady = auth.status?.account?.ready === true;
+  const { events: feed, hits, connected: feedConnected, clear: clearFeed } = useActivityFeed();
 
   const params = paramsByMode[mode] ?? {};
 
@@ -310,14 +313,20 @@ export function CheckerProvider({ children }: { children: ReactNode }) {
       setConnectOpen(true);
       return;
     }
+    if (autoClaim && !accountReady) {
+      toast.error(`Auto-claim is on, but the Xbox account can't claim yet: ${auth.status?.account?.reason ?? "connect Xbox first"}`);
+      setConnectOpen(true);
+      return;
+    }
     startingRef.current = true;
     setStarting(true);
     try {
-      claimFloor.current = latestEventId();
       const body: GamertagSearchInput = {
         config: { mode: mode as GenerationMode, params },
         rate,
         runEthanPolicyCheck: doubleCheck,
+        // Auto-claim runs on the server, so it keeps working with this tab closed.
+        autoClaim,
       };
       const res = await fetch(api("/gamertag/search"), {
         method: "POST",
@@ -326,7 +335,6 @@ export function CheckerProvider({ children }: { children: ReactNode }) {
       });
       if (res.status === 201) {
         const session = (await res.json()) as GamertagSession;
-        setClaimStatuses(new Map());
         persistSession(session.sessionId);
         toast.success("Search started");
       } else {
@@ -339,7 +347,7 @@ export function CheckerProvider({ children }: { children: ReactNode }) {
       startingRef.current = false;
       setStarting(false);
     }
-  }, [isRunning, validation, doubleCheck, isAuthed, latestEventId, mode, params, rate, persistSession]);
+  }, [isRunning, validation, doubleCheck, isAuthed, autoClaim, accountReady, auth.status?.account?.reason, mode, params, rate, persistSession]);
 
   const stop = useCallback(async () => {
     if (!sessionId) return;
@@ -372,7 +380,6 @@ export function CheckerProvider({ children }: { children: ReactNode }) {
     if (isRunning) return;
     persistSession(null);
     clearFeed();
-    setClaimStatuses(new Map());
   }, [isRunning, persistSession, clearFeed]);
 
   // ── Saved tags ─────────────────────────────────────────────────────────────
@@ -393,11 +400,52 @@ export function CheckerProvider({ children }: { children: ReactNode }) {
   }, [saved]);
 
   // ── Claim ──────────────────────────────────────────────────────────────────
-  // A claim counts as successful only when the server reports success: Xbox
-  // confirmed it. Available and Double Check approved are separate states.
+  // The backend is the source of truth. Records are polled (they include
+  // server-side auto-claims from the Checker and the Sniper) and a manual
+  // claim applies its own response immediately.
+  const claimCursor = useRef(0);
+  const ingestClaims = useCallback((records: ClaimRecord[]) => {
+    if (records.length === 0) return;
+    // Advance the cursor only past finished records, so an in-flight claim is
+    // fetched again until its outcome arrives.
+    let blocked = false;
+    for (const r of [...records].sort((a, b) => a.id - b.id)) {
+      if (r.finishedAt === null) blocked = true;
+      else if (!blocked && r.id > claimCursor.current) claimCursor.current = r.id;
+    }
+    setClaimRecords((prev) => {
+      const next = new Map(prev);
+      for (const r of records) {
+        const key = r.gamertag.toUpperCase();
+        const cur = next.get(key);
+        if (!cur || cur.id <= r.id) next.set(key, r);
+      }
+      return next;
+    });
+  }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const poll = async () => {
+      try {
+        const res = await fetch(api(`/gamertag/claims?after=${claimCursor.current}`));
+        if (res.ok) ingestClaims(((await res.json()) as { claims: ClaimRecord[] }).claims);
+      } catch { /* retry next tick */ }
+      if (!disposed) timer = setTimeout(poll, document.hidden ? 6_000 : 2_000);
+    };
+    void poll();
+    return () => { disposed = true; if (timer) clearTimeout(timer); };
+  }, [ingestClaims]);
+
   const claim = useCallback(async (gamertag: string) => {
     if (!isAuthed) {
       toast.error("Connect Xbox to claim gamertags.");
+      setConnectOpen(true);
+      return;
+    }
+    if (!accountReady) {
+      toast.error(`The Xbox account can't claim yet: ${auth.status?.account?.reason ?? "not verified"}`);
       setConnectOpen(true);
       return;
     }
@@ -405,40 +453,34 @@ export function CheckerProvider({ children }: { children: ReactNode }) {
     // Synchronous guard: two rapid clicks can never send two requests.
     if (claimsInFlight.current.has(key)) return;
     claimsInFlight.current.add(key);
-    setClaimStatuses((prev) => new Map(prev).set(gamertag, "claiming"));
+    setPendingClaims((prev) => new Set(prev).add(key));
     try {
       const res = await fetch(api("/gamertag/claim"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ gamertag }),
       });
-      const data = (await res.json()) as { success?: boolean; error?: string; message?: string };
-      if (res.ok && data.success === true) {
-        setClaimStatuses((prev) => new Map(prev).set(gamertag, "claimed"));
-        toast.success(`Claimed ${gamertag}`, { duration: 8000 });
+      const data = (await res.json()) as { success?: boolean; message?: string; claim?: ClaimRecord };
+      if (data.claim) ingestClaims([data.claim]);
+      if (data.success === true && data.claim?.state === "claimed") {
+        toast.success(`Claimed ${gamertag} — confirmed by Xbox`, { duration: 8000 });
       } else {
-        setClaimStatuses((prev) => new Map(prev).set(gamertag, toClaimStatus(data.error)));
         toast.error(data.message ?? `Could not claim ${gamertag}`);
       }
     } catch {
-      setClaimStatuses((prev) => new Map(prev).set(gamertag, "error"));
-      toast.error(`Network error while claiming ${gamertag}`);
+      toast.error(`Network error while claiming ${gamertag}. Check the claim status before retrying.`);
     } finally {
       claimsInFlight.current.delete(key);
+      setPendingClaims((prev) => { const n = new Set(prev); n.delete(key); return n; });
     }
-  }, [isAuthed]);
+  }, [isAuthed, accountReady, auth.status?.account?.reason, ingestClaims]);
 
-  // ── Auto-claim: only hits from this browser's own active session ───────────
-  const attemptedClaims = useRef(new Set<string>());
-  useEffect(() => {
-    if (!autoClaim || !isAuthed || !sessionId) return;
-    for (const hit of hits) {
-      if (hit.id <= claimFloor.current || hit.sessionId !== sessionId) continue;
-      if (attemptedClaims.current.has(hit.username)) continue;
-      attemptedClaims.current.add(hit.username);
-      void claim(hit.username);
-    }
-  }, [hits, autoClaim, isAuthed, sessionId, claim]);
+  const claimStatuses = useMemo(() => {
+    const m = new Map<string, ClaimStatus>();
+    for (const [key, r] of claimRecords) m.set(key, r.state);
+    for (const key of pendingClaims) if (!m.has(key) || m.get(key) !== "claimed") m.set(key, "claiming");
+    return m;
+  }, [claimRecords, pendingClaims]);
 
   const value = useMemo<CheckerContextValue>(() => ({
     mode, setMode, params, setParams, validation,
@@ -447,14 +489,14 @@ export function CheckerProvider({ children }: { children: ReactNode }) {
     rate, setRate, doubleCheck, setDoubleCheck, autoClaim, setAutoClaim,
     sessionId, snapshot, isRunning, isPaused, starting, start, stop, togglePause, reset,
     feed, feedConnected, clearFeed, hits,
-    saved, save, unsave, exportSaved, claimStatuses, claim,
-    auth, isAuthed, connectOpen, setConnectOpen,
+    saved, save, unsave, exportSaved, claimStatuses, claimRecords, claim,
+    auth, isAuthed, accountReady, connectOpen, setConnectOpen,
   }), [
     mode, setMode, params, setParams, validation, savedTemplates, applyTemplate, saveTemplate, deleteTemplate, lastRealMode,
     rate, setRate, doubleCheck, setDoubleCheck, autoClaim, setAutoClaim,
     sessionId, snapshot, isRunning, isPaused, starting, start, stop, togglePause, reset,
-    feed, feedConnected, clearFeed, hits, saved, save, unsave, exportSaved, claimStatuses, claim,
-    auth, isAuthed, connectOpen,
+    feed, feedConnected, clearFeed, hits, saved, save, unsave, exportSaved, claimStatuses, claimRecords, claim,
+    auth, isAuthed, accountReady, connectOpen,
   ]);
 
   return <CheckerContext.Provider value={value}>{children}</CheckerContext.Provider>;

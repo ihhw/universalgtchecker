@@ -38,11 +38,9 @@ description: How the gamertag checker works — concurrency model, endpoint casc
 - There is no clean-characters option; use Customizable > Remove / Shouldn't have to exclude characters.
 - Endpoints: `POST /api/gamertag/config/validate` (config check), `POST /api/gamertag/validate` (username check).
 
-## Auto-claim suffix rejection
-- Claim route checks Xbox's response body for returned `gamertag`/`Gamertag` field.
-- If the assigned tag != requested tag (Xbox added suffix), returns HTTP 409 `suffix_assigned` and does NOT accept the claim.
-- Tries XUID-scoped URL first (`/users/xuid({xuid})/gamertags/{gt}`), falls back to bare `/gamertags/{gt}`.
-- XUID extracted from XSTS `DisplayClaims.xui[0].xid` and stored in auth cache.
+## Auto-claim
+- See gamertag-autoclaim.md. Suffix protection: a reserve or change response with a non-empty `gamertagSuffix` or a different tag is never treated as CLAIMED.
+- XUID and gamertag come from XSTS `DisplayClaims.xui[0].xid` / `.gtg`.
 
 ## CPS tracking
 - `session.recentCheckTs: number[]` — rolling 5-second window timestamps

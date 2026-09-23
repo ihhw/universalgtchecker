@@ -9,12 +9,15 @@ const CLAIM_LABEL: Record<ClaimStatus, string> = {
   idle: "Claim",
   claiming: "Claiming",
   claimed: "Claimed",
-  error: "Retry",
-  rate_limited: "Retry",
-  auth_failed: "Reconnect",
-  auth_required: "Connect",
-  rejected: "Rejected",
+  claim_failed: "Claim failed",
+  auth_error: "Auth error",
+  rate_limited: "Rate limited",
+  network_error: "Retry",
+  unknown: "Unconfirmed",
 };
+
+/** Final states where another click can't help (claimed, or needs a look first). */
+const CLAIM_FINAL: ReadonlySet<ClaimStatus> = new Set(["claimed", "claiming", "unknown"]);
 
 async function copy(text: string) {
   try {
@@ -59,9 +62,10 @@ export default function HitsPage() {
           ) : (
             <ul className="mt-4 divide-y divide-border/60 rounded-lg border border-border bg-[hsl(var(--well))]">
               {hits.map((h) => {
-                const status = c.claimStatuses.get(h.username) ?? "idle";
+                const status = c.claimStatuses.get(h.username.toUpperCase()) ?? "idle";
+                const record = c.claimRecords.get(h.username.toUpperCase());
                 const busy = status === "claiming";
-                const done = status === "claimed" || status === "rejected" || busy;
+                const done = CLAIM_FINAL.has(status);
                 return (
                   <li key={h.id} className="flex flex-wrap items-center gap-x-4 gap-y-2 px-4 py-3">
                     <div className="min-w-0 flex-1">
@@ -72,6 +76,9 @@ export default function HitsPage() {
                         <Chip tone="gold">AVAILABLE</Chip>
                         {h.policy === "approved" && <Chip tone="gold">DOUBLE CHECK APPROVED</Chip>}
                         {status === "claimed" && <Chip tone="gold">CLAIMED</Chip>}
+                        {status !== "idle" && status !== "claimed" && status !== "claiming" && (
+                          <Chip tone="muted">{CLAIM_LABEL[status].toUpperCase()}</Chip>
+                        )}
                         <span className="font-mono text-[11px] text-muted-foreground">
                           {h.format} · {formatClock(h.ts)}
                         </span>
@@ -91,6 +98,7 @@ export default function HitsPage() {
                         type="button"
                         className={cn(btn, status === "claimed" && "border-primary/50 text-primary")}
                         disabled={done}
+                        title={record?.reason ?? undefined}
                         aria-busy={busy}
                         onClick={() => void c.claim(h.username)}
                       >
@@ -127,7 +135,7 @@ export default function HitsPage() {
           ) : (
             <ul className="mt-4 divide-y divide-border/60 rounded-lg border border-border bg-[hsl(var(--well))]">
               {c.saved.map((tag) => {
-                const status = c.claimStatuses.get(tag) ?? "idle";
+                const status = c.claimStatuses.get(tag.toUpperCase()) ?? "idle";
                 const busy = status === "claiming";
                 return (
                   <li key={tag} className="flex flex-wrap items-center gap-3 px-4 py-3">
@@ -136,7 +144,8 @@ export default function HitsPage() {
                     <button
                       type="button"
                       className={btn}
-                      disabled={status === "claimed" || status === "rejected" || busy}
+                      disabled={CLAIM_FINAL.has(status)}
+                      title={c.claimRecords.get(tag.toUpperCase())?.reason ?? undefined}
                       aria-busy={busy}
                       onClick={() => void c.claim(tag)}
                     >

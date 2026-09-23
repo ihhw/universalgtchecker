@@ -6,10 +6,17 @@ import { ConnectXboxButton, ConnectXboxDialog } from "@/components/xbox-connect"
 import { cn } from "@/lib/utils";
 
 interface NavItem { label: string; href: string; match?: (path: string) => boolean }
+interface NavGroup { label: string; items: NavItem[] }
 
 // New platform checkers are added here as they are integrated.
-const PLATFORMS: NavItem[] = [
-  { label: "Xbox", href: "/xbox" },
+const PLATFORMS: NavGroup[] = [
+  {
+    label: "Xbox",
+    items: [
+      { label: "Checker", href: "/xbox" },
+      { label: "Sniper", href: "/xbox/sniper" },
+    ],
+  },
 ];
 
 const WORKSPACE: NavItem[] = [
@@ -19,7 +26,7 @@ const WORKSPACE: NavItem[] = [
   { label: "Settings", href: "/settings" },
 ];
 
-function NavLink({ item, path }: { item: NavItem; path: string }) {
+function NavLink({ item, path, nested }: { item: NavItem; path: string; nested?: boolean }) {
   const active = item.match ? item.match(path) : path === item.href;
   return (
     <Link
@@ -27,6 +34,7 @@ function NavLink({ item, path }: { item: NavItem; path: string }) {
       aria-current={active ? "page" : undefined}
       className={cn(
         "relative flex items-center rounded-lg px-4 py-2 text-sm transition-colors",
+        nested && "pl-7",
         active
           ? "bg-secondary text-foreground before:absolute before:inset-y-2 before:left-0 before:w-[3px] before:rounded-full before:bg-primary"
           : "text-muted-foreground hover:bg-secondary/60 hover:text-foreground",
@@ -48,7 +56,14 @@ function SidebarBody({ path }: { path: string }) {
         <div>
           <p className="eyebrow px-4 pb-2">Platforms</p>
           <div className="space-y-0.5">
-            {PLATFORMS.map((item) => <NavLink key={item.label} item={item} path={path} />)}
+            {PLATFORMS.map((group) => (
+              <div key={group.label}>
+                <p className="px-4 pb-1 pt-1.5 text-sm font-medium text-foreground">{group.label}</p>
+                <div className="space-y-0.5">
+                  {group.items.map((item) => <NavLink key={item.href} item={item} path={path} nested />)}
+                </div>
+              </div>
+            ))}
           </div>
         </div>
 

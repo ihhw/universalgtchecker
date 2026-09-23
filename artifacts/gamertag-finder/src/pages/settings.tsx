@@ -154,7 +154,9 @@ export default function SettingsPage() {
             <div className="min-w-0">
               <label htmlFor="autoclaim" className="text-sm font-medium">Claim new hits automatically</label>
               <p className="mt-1 max-w-xl text-[13px] leading-relaxed text-muted-foreground">
-                Applies to searches started in this browser. Claims can't be undone.
+                Runs on the server for searches started while this is on, even with this tab closed.
+                Only hits confirmed available (and Double Check approved when it's on) are claimed,
+                and a search stops auto-claiming after its first Xbox-confirmed claim. Claims can't be undone.
               </p>
             </div>
             <Switch
