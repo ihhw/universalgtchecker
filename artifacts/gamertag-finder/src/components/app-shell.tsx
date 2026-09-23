@@ -20,6 +20,7 @@ const PLATFORMS: NavGroup[] = [
 ];
 
 const WORKSPACE: NavItem[] = [
+  { label: "Home", href: "/" },
   { label: "Hits", href: "/hits" },
   { label: "Live activity", href: "/activity" },
   { label: "System status", href: "/status" },

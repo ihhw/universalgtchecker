@@ -1,8 +1,9 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { Redirect, Route, Switch, Router as WouterRouter } from "wouter";
+import { Route, Switch, Router as WouterRouter } from "wouter";
 import { Toaster } from "sonner";
 import { AppShell } from "@/components/app-shell";
 import { CheckerProvider } from "@/state/checker";
+import HomePage from "@/pages/home";
 import XboxPage from "@/pages/xbox";
 import SniperPage from "@/pages/sniper";
 import HitsPage from "@/pages/hits";
@@ -16,9 +17,7 @@ const queryClient = new QueryClient();
 function Routes() {
   return (
     <Switch>
-      <Route path="/">
-        <Redirect to="/xbox" />
-      </Route>
+      <Route path="/" component={HomePage} />
       <Route path="/xbox" component={XboxPage} />
       <Route path="/xbox/sniper" component={SniperPage} />
       <Route path="/hits" component={HitsPage} />

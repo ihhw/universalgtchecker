@@ -1,13 +1,9 @@
-import { useEffect, useState } from "react";
 import { Panel, PageHeader } from "@/components/panel";
 import { useChecker } from "@/state/checker";
-import { api } from "@/lib/api";
+import { useSystemStatus, type ServiceState } from "@/hooks/use-system-status";
 import { cn } from "@/lib/utils";
 
-type State = "online" | "degraded" | "offline" | "unknown";
-interface Service { id: string; label: string; state: State; detail: string }
-
-const STATE_STYLE: Record<State, { text: string; dot: string; label: string }> = {
+const STATE_STYLE: Record<ServiceState, { text: string; dot: string; label: string }> = {
   online: { text: "text-primary", dot: "bg-primary", label: "ONLINE" },
   degraded: { text: "text-primary/70", dot: "bg-primary/50", label: "DEGRADED" },
   offline: { text: "text-destructive", dot: "bg-destructive", label: "OFFLINE" },
@@ -18,51 +14,19 @@ const POLL_MS = 5_000;
 
 export default function StatusPage() {
   const { feedConnected } = useChecker();
-  const [services, setServices] = useState<Service[] | null>(null);
-  const [apiReachable, setApiReachable] = useState<boolean | null>(null);
-  const [checkedAt, setCheckedAt] = useState<number | null>(null);
+  const { rows: baseRows, apiReachable, checkedAt, loading } = useSystemStatus();
 
-  useEffect(() => {
-    let disposed = false;
-    let timer: ReturnType<typeof setTimeout> | null = null;
-    const controller = new AbortController();
-
-    const tick = async () => {
-      try {
-        const res = await fetch(api("/status"), { signal: controller.signal });
-        if (!res.ok) throw new Error(String(res.status));
-        const data = (await res.json()) as { checkedAt: number; services: Service[] };
-        if (!disposed) { setServices(data.services); setCheckedAt(data.checkedAt); setApiReachable(true); }
-      } catch {
-        if (!disposed) setApiReachable(false);
-      } finally {
-        if (!disposed) timer = setTimeout(tick, POLL_MS);
-      }
-    };
-    void tick();
-
-    return () => { disposed = true; controller.abort(); if (timer) clearTimeout(timer); };
-  }, []);
-
-  // If the API cannot be reached, nothing else can be verified: say so.
-  const rows: Service[] = apiReachable === false
-    ? [
-        { id: "api", label: "API", state: "offline", detail: "Unreachable from this browser" },
-        ...["Xbox API", "Checker engine", "Realtime", "Discord bot"].map((label) => ({
-          id: label, label, state: "unknown" as State, detail: "Can't be verified without the API",
-        })),
-      ]
-    : (services ?? []).map((s) =>
-        s.id === "realtime"
-          ? { ...s, detail: `${s.detail} · browser ${feedConnected ? "live" : "polling"}` }
-          : s,
-      );
+  const rows = baseRows.map((s) =>
+    s.id === "realtime"
+      ? { ...s, detail: `${s.detail} · browser ${feedConnected ? "live" : "polling"}` }
+      : s,
+  );
 
   return (
     <>
       <PageHeader title="System status" />
       <Panel>
-        {services === null && apiReachable === null ? (
+        {loading ? (
           <p className="py-8 text-center text-sm text-muted-foreground" role="status">Checking…</p>
         ) : (
           <ul className="divide-y divide-border/60">
