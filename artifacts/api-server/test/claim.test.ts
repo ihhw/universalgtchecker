@@ -125,6 +125,18 @@ test("403 at reserve → AUTH ERROR; 403 at change → CLAIM FAILED (not allowed
   assert.match(r2.reason ?? "", /No free gamertag change/);
 });
 
+test("403 at change with Xbox code 5025 → CLAIM FAILED (not allowed), plain-language reason", async () => {
+  await control(mock.url, {
+    queues: { change: [{ status: 403, body: { source: "Accounts", code: 5025, description: "272abc3c-8b49-469f-b589-72eaa902fa64", data: null } }] },
+  });
+  const r = await claim.claimGamertag("NoFreeChange", { source: "manual" });
+  assert.equal(r.state, "claim_failed");
+  assert.equal(r.errorCode, "not_allowed");
+  assert.equal(r.httpStatus, 403);
+  assert.match(r.reason ?? "", /unrelated to the target name itself/);
+  assert.match(r.reason ?? "", /official Xbox app/);
+});
+
 test("429 → RATE LIMITED with Retry-After honoured (reserve and change)", async () => {
   await control(mock.url, { queues: { reserve: [{ status: 429, body: {}, headers: { "Retry-After": "7" } }] } });
   const r1 = await claim.claimGamertag("Busy", { source: "manual" });

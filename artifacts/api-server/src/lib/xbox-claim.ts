@@ -186,6 +186,18 @@ const ACCOUNTS_ERROR: Record<number, string> = {
     "The Checker's availability signal (the avatar CDN plus the reserve policy check) can say " +
     "AVAILABLE for a name Xbox's own account system still considers taken — this final claim step " +
     "is the only fully authoritative check. Try a target you've independently confirmed is free.",
+  // Seen live as HTTP 403 with `description` literally being a GUID (not text) — a different kind
+  // of rejection than 1372, and it fired on multiple different, unrelated target gamertags, so it
+  // is not about the specific name. Two honest possibilities, not yet distinguished: (a) this Xbox
+  // account has no free gamertag change available right now (checkable in the official Xbox app),
+  // or (b) this app's registration is not authorized to perform gamertag changes even though it can
+  // sign in and reserve names. Check via the official Xbox app first — it's the cheapest way to
+  // tell which.
+  5025: "Xbox refused this specific change (code 5025) for a reason unrelated to the target name " +
+    "itself — it happened on multiple different, unrelated gamertags in a row. Either this account " +
+    "has no free gamertag change available right now, or this app isn't authorized to perform the " +
+    "change even though it can sign in and reserve names. Check whether the official Xbox app shows " +
+    "a free gamertag change available for this account before trying again here.",
 };
 
 function sameTag(a: string | null | undefined, b: string): boolean {
@@ -450,9 +462,12 @@ export async function claimGamertag(
       });
     }
     if (cs === 403) {
+      const code = xboxErrorCode(cBody);
+      const known = code !== null ? ACCOUNTS_ERROR[code] : undefined;
       return finish("claim_failed", {
-        ...cbase, errorCode: "not_allowed",
-        reason: `Xbox refused the gamertag change for this account (HTTP 403)${cDesc ? `: ${cDesc}` : ""}. The account may not have a free gamertag change, or is restricted.`,
+        ...cbase,
+        errorCode: "not_allowed",
+        reason: known ?? `Xbox refused the gamertag change for this account (HTTP 403)${cDesc ? `: ${cDesc}` : ""}. The account may not have a free gamertag change, or is restricted.`,
       });
     }
     if (cs === 409) {

@@ -21,14 +21,16 @@ are added to the sidebar in `components/app-shell.tsx` as they are integrated.
   `api-server/src/lib/xbox-claim.ts`: reserve (`POST gamertag.xboxlive.com/gamertags/reserve`) then change
   (`POST accounts.xboxlive.com/users/current/profile/gamertag`, `{ Gamertag, PreviewOnly: false,
   ReservationId: <xuid> }`, contract version 3), authorized with the `http://xboxlive.com` XSTS token. **The
-  URL and method are confirmed correct against live Xbox**, and adding `ReservationId` is confirmed to fix an
-  earlier false "gamertag belongs to another user" (code 1372) rejection that hit every tested string. The
-  success (200, actually-applied) path is still NOT confirmed live — the last live attempt got HTTP 200 with
-  body `{"hasFree":true}` and no applied change (the claim engine correctly reported this as UNKNOWN, not
-  CLAIMED); the body was switched to PascalCase in response but that hasn't been tested live yet. See
-  `.agents/memory/gamertag-autoclaim.md` for the full timeline and what to try next. Xbox error code 1372 is
-  mapped to a plain-language explanation: the availability heuristics (CDN + reserve policy check) can say
-  AVAILABLE for a tag the accounts service still considers taken; the change step is the only fully
+  URL, method and body shape are all confirmed correct against live Xbox** (an earlier lowercase body got a
+  false-preview 200 `{"hasFree":true}` with nothing applied — the claim engine correctly reported this as
+  UNKNOWN, not CLAIMED — and PascalCase got past that). The current live blocker is **HTTP 403 code 5025**
+  (`description` is a GUID, not text), fired on multiple unrelated targets — this looks like an
+  account/app-authorization question (does this account have a free change available, or is this app's
+  registration allowed to perform changes at all), not a request-format problem, so further guessing at the
+  body is not the next step. See `.agents/memory/gamertag-autoclaim.md` for the full timeline and the one test
+  (an actual rename attempt through Xbox's own official app) that distinguishes the two hypotheses. Xbox error
+  code 1372 is mapped to a plain-language explanation: the availability heuristics (CDN + reserve policy check)
+  can say AVAILABLE for a tag the accounts service still considers taken; the change step is the only fully
   authoritative check.
   A claim is `claimed` only when Xbox's response names the exact tag, or a freshly issued XSTS token reports it.
   One claim runs at a time. Checker auto-claim runs server-side and stops after the first confirmed claim.
