@@ -212,6 +212,22 @@ test("400 at change with an unrecognized Xbox code → CLAIM FAILED (rejected) w
   assert.match(r.reason ?? "", /Something else entirely/);
 });
 
+test("change applied but the identity service lags a few seconds → retried until it catches up, not falsely UNKNOWN", async () => {
+  // 200 with an ambiguous body (no gamertag field) never updates mock.state
+  // itself; the account's gamertag only changes 3s later, simulating Xbox's
+  // sign-in/identity service catching up with a write already applied
+  // elsewhere. This is exactly the real scenario reported 2026-09-23: a
+  // confirmed real rename that a single, immediate identity check missed.
+  await control(mock.url, { queues: { change: [{ status: 200, body: {} }] } });
+  const before = mock.state.gamertag;
+  const p = claim.claimGamertag("LaggedTag", { source: "manual" });
+  setTimeout(() => { mock.state.gamertag = "LaggedTag"; }, 3_000);
+  const r = await p;
+  assert.equal(r.state, "claimed");
+  assert.equal(r.confirmedBy, "xsts_identity");
+  assert.notEqual(before, "LaggedTag");
+});
+
 test("timeout at reserve → NETWORK ERROR; timeout at change → UNKNOWN", async () => {
   await control(mock.url, { queues: { reserve: [{ delayMs: 2_500, status: 200, body: {} }] } });
   const r1 = await claim.claimGamertag("SlowRes", { source: "manual" });

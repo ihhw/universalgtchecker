@@ -21,17 +21,16 @@ are added to the sidebar in `components/app-shell.tsx` as they are integrated.
   `api-server/src/lib/xbox-claim.ts`: reserve (`POST gamertag.xboxlive.com/gamertags/reserve`) then change
   (`POST accounts.xboxlive.com/users/current/profile/gamertag`, `{ Gamertag, PreviewOnly: false,
   ReservationId: <xuid> }`, contract version 3), authorized with the `http://xboxlive.com` XSTS token. **The
-  URL, method and body shape are all confirmed correct against live Xbox** (an earlier lowercase body got a
-  false-preview 200 `{"hasFree":true}` with nothing applied — the claim engine correctly reported this as
-  UNKNOWN, not CLAIMED — and PascalCase got past that). The current live blocker is **HTTP 403 code 5025**
-  (`description` is a GUID, not text), fired on multiple unrelated targets — this looks like an
-  account/app-authorization question (does this account have a free change available, or is this app's
-  registration allowed to perform changes at all), not a request-format problem, so further guessing at the
-  body is not the next step. See `.agents/memory/gamertag-autoclaim.md` for the full timeline and the one test
-  (an actual rename attempt through Xbox's own official app) that distinguishes the two hypotheses. Xbox error
-  code 1372 is mapped to a plain-language explanation: the availability heuristics (CDN + reserve policy check)
-  can say AVAILABLE for a tag the accounts service still considers taken; the change step is the only fully
-  authoritative check.
+  full flow is confirmed working end-to-end against live Xbox (2026-09-23)** — a real claim through this app
+  renamed the user's Xbox account. See `.agents/memory/gamertag-autoclaim.md` for the full live-testing
+  timeline (an HTTP 403 code 5025 turned out to mean "no free gamertag change available on the account", not an
+  app-authorization problem). One real bug was found live and fixed: `confirmViaIdentity()` checked only once,
+  immediately, for the account's new gamertag to appear via XSTS — but that service can lag a few seconds
+  behind a change just applied on `accounts.xboxlive.com`, causing a real success to be reported as `UNKNOWN`.
+  It now retries with short pauses (~6s budget) before giving up. Xbox error code 1372 ("gamertag belongs to
+  another user") is mapped to a plain-language explanation: the availability heuristics (CDN + reserve policy
+  check) can say AVAILABLE for a tag the accounts service still considers taken; the change step is the only
+  fully authoritative check.
   A claim is `claimed` only when Xbox's response names the exact tag, or a freshly issued XSTS token reports it.
   One claim runs at a time. Checker auto-claim runs server-side and stops after the first confirmed claim.
   Recent claim records: `GET /api/gamertag/claims`.

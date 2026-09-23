@@ -523,12 +523,27 @@ export async function claimGamertag(
 }
 
 /** Re-issues XSTS and checks whether Xbox now reports the requested gamertag. */
+// Xbox's account/profile service (accounts.xboxlive.com) and its sign-in
+// token service (xsts.auth.xboxlive.com, which is what tells us the
+// account's gamertag) are separate systems. A change accepted by the former
+// can take a few seconds to be visible to the latter. Live testing
+// (2026-09-23) showed a real, Xbox-confirmed rename reported as
+// "unconfirmed" because the identity check ran once, immediately, before
+// that propagation finished. Retry with short pauses instead of giving up
+// after one instant check.
+const CONFIRM_RETRY_DELAYS_MS = [1_500, 2_000, 2_500];
+
 async function confirmViaIdentity(record: ClaimRecord, gamertag: string): Promise<boolean> {
   const t = now();
   try {
-    const id = await refreshActiveIdentity();
-    record.assignedGamertag = id.gamertag;
-    return id.ok && sameTag(id.gamertag, gamertag);
+    for (let attempt = 0; ; attempt++) {
+      const id = await refreshActiveIdentity();
+      record.assignedGamertag = id.gamertag;
+      if (id.ok && sameTag(id.gamertag, gamertag)) return true;
+      const delay = CONFIRM_RETRY_DELAYS_MS[attempt];
+      if (delay === undefined) return false;
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
   } catch {
     return false;
   } finally {
