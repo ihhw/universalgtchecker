@@ -31,7 +31,8 @@ export const StartGamertagSearchBody = zod.object({
   "params": zod.record(zod.string(), zod.unknown()).optional().describe('Settings for the selected mode. Validated server-side.')
 }),
   "rate": zod.number().min(1).max(startGamertagSearchBodyRateMax).describe('Checks per second'),
-  "runEthanPolicyCheck": zod.boolean().optional().describe('When true, run the Xbox reserve policy check (Double Check) on tags that pass the primary lookup')
+  "runEthanPolicyCheck": zod.boolean().optional().describe('When true, run the Xbox reserve policy check (Double Check) on tags that pass the primary lookup'),
+  "autoClaim": zod.boolean().optional().describe('When true, the server claims the first confirmed hit (available, and Double Check approved when enabled) for the connected Xbox account')
 })
 
 export const StartGamertagSearchResponse = zod.object({

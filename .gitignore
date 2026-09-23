@@ -57,3 +57,7 @@ artifacts/api-server/state.json
 artifacts/discord-bot/search_state.json
 
 artifacts/api-server/webhook.json
+
+# Xbox Sniper persisted state (runtime)
+artifacts/api-server/sniper.json
+sniper.json

@@ -7,6 +7,7 @@ import pinoHttp from "pino-http";
 import router from "./routes";
 import { logger } from "./lib/logger";
 import { preWarmXboxAuth } from "./lib/xbox-auth";
+import { initSniper } from "./lib/xbox-sniper";
 
 const app: Express = express();
 
@@ -65,5 +66,8 @@ if (fs.existsSync(indexHtml)) {
 // Pre-warm Xbox XSTS token if a refresh token is already saved.
 // This ensures the first gamertag check doesn't pay the token-refresh latency.
 preWarmXboxAuth();
+
+// Restore the sniper; a run that was watching when the server stopped resumes.
+initSniper();
 
 export default app;

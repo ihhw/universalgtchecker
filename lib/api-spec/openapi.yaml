@@ -186,6 +186,9 @@ components:
         runEthanPolicyCheck:
           type: boolean
           description: "When true, run the Xbox reserve policy check (Double Check) on tags that pass the primary lookup"
+        autoClaim:
+          type: boolean
+          description: "When true, the server claims the first confirmed hit (available, and Double Check approved when enabled) for the connected Xbox account"
 
     GamertagResultStatus:
       type: string

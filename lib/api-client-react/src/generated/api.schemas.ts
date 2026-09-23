@@ -61,6 +61,8 @@ export interface GamertagSearchInput {
   rate: number;
   /** When true, run the Xbox reserve policy check (Double Check) on tags that pass the primary lookup */
   runEthanPolicyCheck?: boolean;
+  /** When true, the server claims the first confirmed hit (available, and Double Check approved when enabled) for the connected Xbox account */
+  autoClaim?: boolean;
 }
 
 export type GamertagResultStatus = typeof GamertagResultStatus[keyof typeof GamertagResultStatus];

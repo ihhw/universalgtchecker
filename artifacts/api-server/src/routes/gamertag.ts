@@ -12,15 +12,18 @@ import {
 } from "@workspace/api-zod";
 import { logger } from "../lib/logger";
 import { isBlockedByContentFilter } from "../lib/content-filter";
-import { getAuthHeader, getClaimAuthHeader, getXuid } from "../lib/xbox-auth";
+import { getAuthHeader } from "../lib/xbox-auth";
+import {
+  checkGamertag, checkViaAvailabilityEndpoint, checkViaCDN, runEthanPolicyCheck,
+  type PolicyStatus, type ResultStatus,
+} from "../lib/xbox-availability";
+import { claimGamertag, listClaims, notifyClaimWebhook, type ClaimRecord } from "../lib/xbox-claim";
 import { compileGeneration, type Generator } from "../lib/gamertag-generator";
 import { validateXboxGamertag } from "../lib/xbox-validation";
 import { pushActivity } from "../lib/activity";
 import { getWebhookTarget, sendWebhookPayload } from "../lib/webhook-store";
 
 const router: IRouter = Router();
-
-type ResultStatus = "available" | "taken" | "inappropriate" | "seen" | "unknown" | "error";
 
 interface GamertagResult {
   gamertag: string;
@@ -36,15 +39,6 @@ interface GamertagResult {
   seq?: number;
 }
 
-type PolicyStatus =
-  | "approved"
-  | "banned"
-  | "unavailable"
-  | "rate_limited"
-  | "auth_required"
-  | "not_configured"
-  | "error";
-
 interface Session {
   sessionId:     string;
   mode:          string;
@@ -55,6 +49,14 @@ interface Session {
   exhausted:     boolean;
   rate:          number;
   runEthanPolicyCheck: boolean;
+  /**
+   * Server-side auto-claim. Claims only alertable hits, one at a time, and
+   * switches itself off after the first Xbox-confirmed claim so the account
+   * is never renamed twice by one search.
+   */
+  autoClaim:     boolean;
+  /** Gamertag this session successfully claimed, once Xbox confirmed it. */
+  claimed:       string | null;
   state:         "running" | "completed" | "cancelled";
   paused:        boolean;
   attempts:      number;
@@ -68,7 +70,6 @@ interface Session {
 }
 
 const sessions = new Map<string, Session>();
-const claimsInFlight = new Set<string>();
 
 // Auto-save paths
 const RESULTS_FILE = path.join(process.cwd(), "results.txt");
@@ -76,10 +77,6 @@ const STATE_FILE   = path.join(process.cwd(), "state.json");
 // Persistent deduplication: once an available tag has been emitted, it is
 // never emitted as available again, including after a server restart.
 const shownAvailable = new Set<string>();
-const ETHAN_POLICY_URL = "https://user.mgt.xboxlive.com/gamertags/reserve";
-const POLICY_REQUEST_SPACING_MS = 350;
-let lastPolicyRequestAt = 0;
-let policyRequestQueue = Promise.resolve();
 
 try {
   const saved = fs.readFileSync(RESULTS_FILE, "utf8");
@@ -141,79 +138,6 @@ function saveState(sessionId: string, label: string, found: string[]): void {
   } catch { /* ignore */ }
 }
 
-function getReservationId(): string | null {
-  // Xbox's reserve API accepts the signed-in account's XUID as the
-  // reservationId. The explicit env value remains available for accounts or
-  // legacy flows that provide a different reservation identifier.
-  const configured = process.env.XBOX_RESERVATION_ID?.trim();
-  return configured || getXuid();
-}
-
-function waitForPolicyRequestSlot(signal: AbortSignal): Promise<void> {
-  const acquire = policyRequestQueue.then(async () => {
-    const delay = Math.max(0, POLICY_REQUEST_SPACING_MS - (Date.now() - lastPolicyRequestAt));
-    if (delay > 0) await wait(delay, signal);
-    if (!signal.aborted) lastPolicyRequestAt = Date.now();
-  });
-  policyRequestQueue = acquire.catch(() => undefined);
-  return acquire;
-}
-
-async function runEthanPolicyCheck(
-  gamertag: string,
-  signal: AbortSignal,
-): Promise<{ status: PolicyStatus; message?: string }> {
-  const authHeader = await getAuthHeader();
-  if (!authHeader) return { status: "auth_required", message: "Sign in to Xbox to run the secondary policy check." };
-
-  const reservationId = getReservationId();
-  if (!reservationId) {
-    return {
-      status: "not_configured",
-      message: "The server is missing XBOX_RESERVATION_ID.",
-    };
-  }
-
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      await waitForPolicyRequestSlot(signal);
-      const response = await fetch(ETHAN_POLICY_URL, {
-        method: "POST",
-        signal,
-        headers: {
-          Authorization: authHeader,
-          "Content-Type": "application/json",
-          "x-xbl-contract-version": "1",
-        },
-        body: JSON.stringify({ gamertag, reservationId }),
-      });
-
-      if (response.status === 200) return { status: "approved" };
-      if (response.status === 400) return { status: "banned", message: "Xbox marked this gamertag as unacceptable." };
-      if (response.status === 409) return { status: "unavailable", message: "Xbox reports this gamertag is no longer available." };
-      if (response.status === 401 || response.status === 403) {
-        return { status: "auth_required", message: "The Xbox authorization token was rejected." };
-      }
-      if (response.status === 429) {
-        if (attempt === 0) {
-          logger.warn({ gamertag }, "Ethan policy check rate-limited; retrying in 5 seconds");
-          await wait(5_000, signal);
-          continue;
-        }
-        return { status: "rate_limited", message: "Xbox rate-limited the secondary policy check." };
-      }
-
-      logger.warn({ gamertag, status: response.status }, "Unexpected Ethan policy check response");
-      return { status: "error", message: `Xbox returned HTTP ${response.status}.` };
-    } catch (err) {
-      if (signal.aborted) return { status: "error", message: "Secondary policy check cancelled." };
-      logger.warn({ gamertag, err }, "Ethan policy check request failed");
-      return { status: "error", message: "Secondary policy check failed." };
-    }
-  }
-  return { status: "rate_limited", message: "Xbox rate-limited the secondary policy check." };
-}
-
 // Clean up completed/cancelled sessions after 10 minutes
 setInterval(() => {
   for (const [id, session] of sessions.entries()) {
@@ -250,136 +174,6 @@ class Semaphore {
     } else {
       this.count++;
     }
-  }
-}
-
-// ─── Availability check ───────────────────────────────────────────────────────
-//
-// Endpoint cascade (in priority order):
-//   1. gamertag.xboxlive.com/gamertags/{gt}/availability  — authenticated; most accurate
-//   2. avatar-ssl.xboxlive.com CDN                        — unauthenticated fallback
-//
-// NOTE: profile.xboxlive.com is intentionally NOT used — it is rate-limited
-// (Retry-After: 299) from Replit server IPs even with valid XSTS auth.
-
-function wait(ms: number, signal: AbortSignal): Promise<void> {
-  return new Promise<void>((resolve) => {
-    if (signal.aborted) { resolve(); return; }
-    const t = setTimeout(resolve, ms);
-    signal.addEventListener("abort", () => { clearTimeout(t); resolve(); }, { once: true });
-  });
-}
-
-/**
- * Primary check — gamertag.xboxlive.com availability endpoint.
- * Requires a valid XSTS auth header. Returns null if the endpoint is
- * unavailable/rate-limited so the caller can fall through to the CDN.
- */
-async function checkViaAvailabilityEndpoint(
-  gt: string,
-  authHeader: string,
-  signal: AbortSignal,
-): Promise<Exclude<ResultStatus, "error"> | null> {
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      const res = await fetch(
-        `https://gamertag.xboxlive.com/gamertags/${encodeURIComponent(gt)}/availability`,
-        {
-          signal,
-          headers: {
-            Authorization:            authHeader,
-            "x-xbl-contract-version": "1",
-            Accept:                   "application/json",
-            "Accept-Language":        "en-US",
-          },
-        },
-      );
-
-      if (res.status === 200) {
-        // Response body: { "isAvailable": true/false, ... }
-        try {
-          const data = (await res.json()) as { isAvailable?: boolean };
-          if (data.isAvailable === true)  return "available";
-          if (data.isAvailable === false) return "taken";
-        } catch { /* fall through */ }
-        // 200 without parseable isAvailable → treat as available (some API versions)
-        return "available";
-      }
-      if (res.status === 409) return "taken";           // conflict = already taken
-      if (res.status === 400) return "inappropriate";   // Xbox rejected tag name
-      if (res.status === 401 || res.status === 403) return null; // bad auth → fall through
-      if (res.status === 429) {
-        if (attempt === 0) {
-          const retryAfter = parseInt(res.headers.get("Retry-After") ?? "2", 10);
-          const waitMs = Math.min(retryAfter * 1_000, 10_000);
-          logger.warn({ gt, retryAfter, waitMs }, "availability endpoint 429 — backing off");
-          await wait(waitMs, signal);
-          continue;
-        }
-        return null; // still rate-limited → fall through to CDN
-      }
-
-      // 404 here means the /availability sub-path isn't supported by this XSTS token's
-      // relying party — fall through to CDN silently.
-      if (res.status !== 404) {
-        logger.warn({ gt, status: res.status }, "availability endpoint unexpected status");
-      }
-      return null;
-    } catch (err) {
-      const name = err instanceof Error ? err.name : "unknown";
-      logger.warn({ gt, errName: name }, "availability endpoint fetch error");
-      return null;
-    }
-  }
-  return null;
-}
-
-/**
- * CDN fallback — avatar-ssl.xboxlive.com.
- * Works without auth. Checks if the gamertag has a classic Xbox 360 CDN entry.
- *   • HTTP 200 → avatar image served → gamertag is TAKEN
- *   • HTTP 401 → not in CDN → likely AVAILABLE (medium confidence for 3–4 char tags)
- */
-async function checkViaCDN(
-  gt: string,
-  signal: AbortSignal,
-): Promise<Exclude<ResultStatus, "error"> | null> {
-  try {
-    const res = await fetch(
-      `https://avatar-ssl.xboxlive.com/avatar/${encodeURIComponent(gt)}/avatar-body.png`,
-      { signal, headers: { Accept: "image/png" } },
-    );
-
-    if (res.status === 200) return "taken";                        // in CDN = profile exists
-    if (res.status === 401 || res.status === 404) return "available"; // not in CDN = likely free
-    return null;
-  } catch {
-    return null;
-  }
-}
-
-// ─── Primary check ────────────────────────────────────────────────────────────
-//
-// Bulk search uses CDN-only (fastest, no rate-limit issues).
-// The authenticated availability endpoint always 404s with the current XSTS
-// relying party ("http://xboxlive.com") — so we skip it in bulk mode to
-// avoid the extra round-trip and double the effective CPS.
-// Single-tag /verify still tries the availability endpoint first.
-
-async function checkGamertag(gt: string, signal: AbortSignal): Promise<ResultStatus> {
-  if (isBlockedByContentFilter(gt)) return "inappropriate";
-
-  try {
-    // CDN is reliable, fast, and has no rate-limit issues from Replit IPs.
-    const cdnResult = await checkViaCDN(gt, signal);
-    if (cdnResult !== null) return cdnResult;
-
-    return "error";
-  } catch (err: unknown) {
-    if (err instanceof Error && (err.name === "AbortError" || err.name === "TimeoutError")) {
-      throw err;
-    }
-    return "error";
   }
 }
 
@@ -551,6 +345,9 @@ async function runSearch(session: Session): Promise<void> {
         // Do not await the alert: a slow Discord endpoint must never pause
         // Xbox checking or reduce the configured worker rate.
         void notifyDiscordWebhook(result, session.label, session.sessionId);
+        // Claim straight from the worker: no browser round trip, so it works
+        // with the tab closed and starts the moment the hit is confirmed.
+        if (session.autoClaim) void autoClaimHit(session, gt);
       }
 
       pushActivity({
@@ -661,7 +458,7 @@ router.post("/gamertag/search", async (req, res): Promise<void> => {
     res.status(400).json({ error: parsed.error.message }); return;
   }
 
-  const { config, rate, runEthanPolicyCheck } = parsed.data;
+  const { config, rate, runEthanPolicyCheck, autoClaim } = parsed.data;
   if (!Number.isFinite(rate) || rate < 1 || rate > 1_000) {
     res.status(400).json({ error: "Rate must be between 1 and 1000 checks per second." });
     return;
@@ -685,6 +482,8 @@ router.post("/gamertag/search", async (req, res): Promise<void> => {
     exhausted:     false,
     rate:          Math.round(rate),
     runEthanPolicyCheck: runEthanPolicyCheck ?? false,
+    autoClaim:     autoClaim ?? false,
+    claimed:       null,
     state:         "running",
     paused:        false,
     attempts:      0,
@@ -698,7 +497,7 @@ router.post("/gamertag/search", async (req, res): Promise<void> => {
   };
 
   sessions.set(sessionId, session);
-  req.log.info({ sessionId, mode: config.mode, rate, runEthanPolicyCheck }, "Starting gamertag search");
+  req.log.info({ sessionId, mode: config.mode, rate, runEthanPolicyCheck, autoClaim }, "Starting gamertag search");
 
   runSearch(session).catch((err) => logger.error({ err, sessionId }, "Search error"));
 
@@ -741,6 +540,8 @@ router.get("/gamertag/sessions/:sessionId", async (req, res): Promise<void> => {
     }),
     paused: session.paused,
     cps:    computeCps(session),
+    autoClaim: session.autoClaim,
+    claimed:   session.claimed,
   });
 });
 
@@ -802,245 +603,71 @@ router.post("/gamertag/sessions/:sessionId/resume", (req, res): void => {
   res.json({ sessionId: rawId, paused: false });
 });
 
-// Claim a gamertag using the server's authenticated Xbox session.
-// No manual token input needed — the device code auth flow provides it.
+// ─── Claim ────────────────────────────────────────────────────────────────────
 //
-// IMPORTANT: We never accept a claim where Xbox silently assigned a suffix
-// (e.g. "MyTag" → "MyTag1234"). We compare the returned gamertag against
-// the requested one and reject any mismatch to prevent the user from
-// accidentally claiming a suffixed tag.
+// Every claim (this route, checker auto-claim, the sniper, the Discord bot)
+// goes through lib/xbox-claim.ts, which reserves then changes the gamertag
+// with the active account's XSTS token + XUID and reports `claimed` ONLY when
+// Xbox confirms the exact gamertag.
+
+const CLAIM_HTTP: Record<ClaimRecord["state"], number> = {
+  claiming: 202,
+  claimed: 200,
+  claim_failed: 409,
+  auth_error: 401,
+  rate_limited: 429,
+  network_error: 502,
+  unknown: 502,
+};
+
+/** Response shape kept compatible with the Discord bot and older clients. */
+function claimResponse(r: ClaimRecord) {
+  return {
+    success: r.state === "claimed",
+    gamertag: r.gamertag,
+    state: r.state,
+    error: r.state === "claimed" ? undefined : (r.errorCode ?? r.state),
+    message: r.state === "claimed"
+      ? `Claimed ${r.gamertag} — confirmed by Xbox (${r.confirmedBy === "change_response" ? "change response" : "account identity"}).`
+      : (r.reason ?? "The claim was not confirmed."),
+    httpStatus: r.httpStatus,
+    step: r.step,
+    confirmedBy: r.confirmedBy,
+    latency: r.latency,
+    claim: r,
+  };
+}
+
+async function autoClaimHit(session: Session, gamertag: string): Promise<void> {
+  if (!session.autoClaim || session.claimed) return;
+  const r = await claimGamertag(gamertag, { source: "checker", sessionId: session.sessionId });
+  if (r.state === "claimed") {
+    session.claimed = r.gamertag;
+    session.autoClaim = false;
+    logger.info({ sessionId: session.sessionId, gamertag }, "Auto-claim confirmed; auto-claim disabled for this search");
+  }
+  if (r.errorCode !== "claim_in_progress") void notifyClaimWebhook(r, "Xbox Auto Claim");
+  // Nothing about a failed claim can be fixed by retrying against a
+  // different account state; stop auto-claiming on auth problems.
+  if (r.state === "auth_error") session.autoClaim = false;
+  broadcastSSE(session, "claim", r);
+}
+
 router.post("/gamertag/claim", async (req, res): Promise<void> => {
-  const { gamertag } = req.body as { gamertag?: string };
-
+  const { gamertag } = (req.body ?? {}) as { gamertag?: string };
   if (!gamertag) {
-    res.status(400).json({ error: "gamertag is required" });
+    res.status(400).json({ success: false, error: "gamertag is required", message: "gamertag is required" });
     return;
   }
-  const validation = validateXboxGamertag(gamertag);
-  if (!validation.valid) {
-    res.status(400).json({
-      success: false, gamertag, error: "invalid_gamertag", message: validation.errors.join(" "),
-    });
-    return;
-  }
+  const r = await claimGamertag(gamertag, { source: "manual" });
+  const status = r.errorCode === "invalid_gamertag" ? 400 : CLAIM_HTTP[r.state];
+  res.status(status).json(claimResponse(r));
+});
 
-  // Only one claim per gamertag can be in flight; a double click or a retry
-  // must never send a second request to Xbox.
-  const claimKey = gamertag.toUpperCase();
-  if (claimsInFlight.has(claimKey)) {
-    res.status(409).json({
-      success: false, gamertag, error: "claim_in_progress", message: "A claim for this gamertag is already in progress.",
-    });
-    return;
-  }
-  claimsInFlight.add(claimKey);
-  const releaseClaim = (): void => { claimsInFlight.delete(claimKey); };
-  res.once("finish", releaseClaim);
-  res.once("close", releaseClaim);
-
-  // Use the gamertag.xboxlive.com-scoped XSTS token for claims.
-  // The general http://xboxlive.com token does NOT work for name changes.
-  const authHeader = await getClaimAuthHeader();
-  if (!authHeader) {
-    res.status(401).json({
-      success: false,
-      gamertag,
-      error: "auth_required",
-      message: "Not authenticated with Xbox. Click 'Sign in to Xbox' and complete the device code flow first.",
-    });
-    return;
-  }
-
-  const xuid = getXuid();
-
-  // ── Pre-check: confirm no suffix before firing the claim PUT ─────────────
-  // Call the availability endpoint first. If Xbox indicates hasSuffix: true,
-  // or the tag is no longer available, abort immediately so we never claim a
-  // suffixed tag by accident.
-  const preCheckHeader = await getAuthHeader();
-  if (preCheckHeader) {
-    try {
-      const availRes = await fetch(
-        `https://gamertag.xboxlive.com/gamertags/${encodeURIComponent(gamertag)}/availability`,
-        {
-          method: "GET",
-          signal: AbortSignal.timeout(10_000),
-          headers: {
-            Authorization:            preCheckHeader,
-            "x-xbl-contract-version": "1",
-            Accept:                   "application/json",
-            "Accept-Language":        "en-US",
-          },
-        },
-      );
-      if (availRes.ok) {
-        const availData = (await availRes.json()) as {
-          isAvailable?: boolean;
-          hasSuffix?:   boolean;
-          suggestedGamertag?: string;
-        };
-        if (availData.hasSuffix === true) {
-          req.log.warn({ gamertag, suggested: availData.suggestedGamertag }, "Pre-check: hasSuffix=true — refusing claim");
-          res.status(409).json({
-            success: false,
-            gamertag,
-            error:   "suffix_required",
-            message: `"${gamertag}" is no longer freely available — Xbox would assign a suffix (e.g. "${availData.suggestedGamertag ?? gamertag + "#1234"}"). Claim aborted.`,
-          });
-          return;
-        }
-        if (availData.isAvailable === false) {
-          req.log.warn({ gamertag }, "Pre-check: isAvailable=false — refusing claim");
-          res.status(409).json({
-            success: false,
-            gamertag,
-            error:   "taken",
-            message: `"${gamertag}" is no longer available. Someone else may have claimed it just now.`,
-          });
-          return;
-        }
-      }
-    } catch (preCheckErr) {
-      // Non-critical — log and proceed; the PUT itself will catch any issues.
-      req.log.warn({ err: String(preCheckErr) }, "Pre-check availability fetch failed — proceeding with claim attempt");
-    }
-  }
-
-  // Helper — parse claim response and reject if Xbox assigned a suffix.
-  // Uses contract v2 for the /current endpoint, v1 for legacy paths.
-  async function attemptClaim(url: string): Promise<{ status: number; body: string }> {
-    const contractVersion = url.endsWith("/current") ? "2" : "1";
-    const r = await fetch(url, {
-      method:  "PUT",
-      signal:  AbortSignal.timeout(15_000),
-      headers: {
-        Authorization:            authHeader!,
-        "Content-Type":           "application/json",
-        "x-xbl-contract-version": contractVersion,
-        Accept:                   "application/json",
-        "Accept-Language":        "en-US",
-      },
-      body: JSON.stringify({ gamertag }),
-    });
-    const body = await r.text().catch(() => "");
-    return { status: r.status, body };
-  }
-
-  try {
-    // Xbox gamertag change endpoint — try multiple URL formats in order.
-    //
-    // Format 1: PUT /users/xuid({xuid})/gamertags/current  (contract v2)
-    //   The "current" endpoint is the standard Xbox Live gamertag change API.
-    //   The desired tag is passed in the JSON body.
-    //
-    // Format 2: PUT /users/xuid({xuid})/gamertags/{tag}    (contract v1, legacy)
-    //   Older format observed in Xbox app traffic — still works on some accounts.
-    //
-    // Format 3: PUT /gamertags/{tag}                        (no-XUID fallback)
-    //   Used when XUID is unavailable.
-    const urls: string[] = xuid
-      ? [
-          `https://gamertag.xboxlive.com/users/xuid(${xuid})/gamertags/current`,
-          `https://gamertag.xboxlive.com/users/xuid(${xuid})/gamertags/${encodeURIComponent(gamertag)}`,
-          `https://gamertag.xboxlive.com/gamertags/${encodeURIComponent(gamertag)}`,
-        ]
-      : [`https://gamertag.xboxlive.com/gamertags/${encodeURIComponent(gamertag)}`];
-
-    let lastStatus = 0;
-    let lastBody   = "";
-
-    for (const url of urls) {
-      const { status, body } = await attemptClaim(url);
-      req.log.info({ gamertag, status, url }, "Gamertag claim attempt");
-      lastStatus = status;
-      lastBody   = body;
-
-      if (status === 200 || status === 201) {
-        // Parse response — check if Xbox silently applied a suffix
-        let assignedTag: string | undefined;
-        try {
-          const data = JSON.parse(body) as { gamertag?: string; Gamertag?: string };
-          assignedTag = data.gamertag ?? data.Gamertag;
-        } catch { /* no body / non-JSON — assume exact match */ }
-
-        if (assignedTag && assignedTag.toUpperCase() !== gamertag.toUpperCase()) {
-          // Xbox assigned a different (suffixed) tag — refuse the claim
-          req.log.warn({ requested: gamertag, assigned: assignedTag }, "Xbox returned a suffixed gamertag — rejecting");
-          res.status(409).json({
-            success: false,
-            gamertag,
-            error: "suffix_assigned",
-            message: `Xbox tried to assign "${assignedTag}" instead of "${gamertag}" (suffix added). Claim rejected — the exact tag is not available.`,
-          });
-          return;
-        }
-
-        res.json({ success: true, gamertag, message: "Gamertag claimed successfully!" });
-        return;
-      }
-
-      // 429 rate-limit — no point retrying the second URL
-      if (status === 429) break;
-      // Auth errors are terminal
-      if (status === 401 || status === 403) break;
-    }
-
-    // Handle final status. A missing XUID is called out because Xbox may
-    // require it for the claim endpoint; the message tells the user how to fix it.
-    const xuidHint = xuid
-      ? ""
-      : " No XUID was resolved for this account, which Xbox may require. Reconnect Xbox and try again.";
-
-    if (lastStatus === 429) {
-      res.status(429).json({
-        success: false, gamertag, error: "rate_limited",
-        message: "Xbox is rate-limiting claims. Try again in a moment.",
-      });
-      return;
-    }
-    if (lastStatus === 401 || lastStatus === 403) {
-      res.status(401).json({
-        success: false, gamertag, error: "auth_failed",
-        message: `Xbox auth token expired or was refused. Reconnect Xbox.${xuidHint}`,
-      });
-      return;
-    }
-    if (lastStatus === 400) {
-      res.status(400).json({
-        success: false, gamertag, error: "rejected",
-        message: `Xbox rejected the claim. The tag may have just been taken or is reserved.${xuidHint}`,
-        detail: lastBody.slice(0, 300),
-      });
-      return;
-    }
-    if (lastStatus === 409 || lastStatus === 412 || lastStatus === 422) {
-      res.status(409).json({
-        success: false, gamertag, error: "rejected",
-        message: "Xbox refused the claim (conflict). The tag was probably just taken or is not allowed.",
-        detail: lastBody.slice(0, 300),
-      });
-      return;
-    }
-    if (lastStatus === 404) {
-      res.status(404).json({
-        success: false, gamertag, error: "not_found",
-        message: `"${gamertag}" doesn't exist as a claimable tag on Xbox — it may be reserved, permanently unavailable, or already owned by a system account. Try a different tag.`,
-      });
-      return;
-    }
-
-    res.status(lastStatus || 500).json({
-      success: false, gamertag, error: "xbox_error",
-      message: `Xbox returned HTTP ${lastStatus}.`,
-      detail: lastBody.slice(0, 300),
-    });
-  } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
-    res.status(500).json({
-      success: false, gamertag, error: "network_error",
-      message: `Network error during claim: ${msg}`,
-    });
-  }
+/** Recent claim records (backend is the source of truth for claim state). */
+router.get("/gamertag/claims", (req, res): void => {
+  const after = Number(req.query["after"] ?? 0);
+  res.json({ claims: listClaims(Number.isFinite(after) ? after : 0) });
 });
 
 // SSE stream

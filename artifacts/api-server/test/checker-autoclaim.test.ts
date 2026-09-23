@@ -1,0 +1,107 @@
+import { test, after, beforeEach } from "node:test";
+import assert from "node:assert/strict";
+import type { AddressInfo } from "node:net";
+import { setup, control, until } from "./helpers";
+
+const { mock } = await setup();
+const { default: app } = await import("../src/app");
+const server = app.listen(0);
+const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}/api`;
+after(() => { server.close(); mock.server.close(); });
+
+beforeEach(() => {
+  mock.state.queues = {};
+  mock.state.sticky = {};
+  mock.state.taken = new Set(["TAKENTAG"]);
+  mock.state.reservations.clear();
+  mock.state.gamertag = "OldTag";
+  mock.state.log.length = 0;
+});
+
+const calls = (ep: string) => mock.state.log.filter((l) => l.endpoint === ep);
+const post = (p: string, body: unknown) => fetch(base + p, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+
+async function runList(names: string[], extra: Record<string, unknown>) {
+  const res = await post("/gamertag/search", { config: { mode: "list", params: { names } }, rate: 5, ...extra });
+  assert.equal(res.status, 201);
+  const { sessionId } = (await res.json()) as { sessionId: string };
+  let snap: any;
+  await until(async () => {
+    snap = await (await fetch(`${base}/gamertag/sessions/${sessionId}`)).json();
+    return snap.state === "completed";
+  }, 10_000);
+  return { sessionId, snap };
+}
+
+test("server-side auto-claim claims the FIRST confirmed hit only, with the browser closed", async () => {
+  const { sessionId, snap } = await runList(["TakenTag", "HitAlpha", "HitBravo"], { runEthanPolicyCheck: true, autoClaim: true });
+  // Wait for any in-flight claim to settle.
+  await until(async () => {
+    const { claims } = (await (await fetch(`${base}/gamertag/claims`)).json()) as { claims: any[] };
+    return claims.filter((c) => c.sessionId === sessionId && c.state !== "claiming").length >= 1;
+  }, 5_000);
+  const final = await (await fetch(`${base}/gamertag/sessions/${sessionId}`)).json() as any;
+  const statuses = Object.fromEntries(snap.results.map((r: any) => [r.gamertag, `${r.status}/${r.policy?.status ?? "-"}/${r.alertable}`]));
+  assert.deepEqual(statuses, {
+    TakenTag: "taken/-/false",
+    HitAlpha: "available/approved/true",
+    HitBravo: "available/approved/true",
+  });
+  assert.ok(["HitAlpha", "HitBravo"].includes(final.claimed), `claimed=${final.claimed}`);
+  assert.equal(final.autoClaim, false, "auto-claim switches off after the first confirmed claim");
+  assert.equal(calls("change").length, 1, "the account is renamed exactly once");
+  assert.equal(mock.state.gamertag, final.claimed);
+});
+
+test("Double Check still gates auto-claim: policy 409 → UNKNOWN, not alertable, never claimed", async () => {
+  await control(mock.url, { sticky: { policy: { status: 409, body: {} } } });
+  const { snap } = await runList(["PolicyNope"], { runEthanPolicyCheck: true, autoClaim: true });
+  const r = snap.results[0];
+  assert.equal(r.status, "unknown");
+  assert.equal(r.policy.status, "unavailable");
+  assert.equal(r.alertable, false);
+  await new Promise((res) => setTimeout(res, 200));
+  assert.equal(calls("reserve").length, 0);
+});
+
+test("auto-claim OFF → hits are reported, nothing is claimed; Double Check OFF classification unchanged", async () => {
+  const { snap } = await runList(["TakenTag", "FreeOnly"], { autoClaim: false });
+  const statuses = Object.fromEntries(snap.results.map((r: any) => [r.gamertag, `${r.status}/${r.alertable}`]));
+  assert.deepEqual(statuses, { TakenTag: "taken/false", FreeOnly: "available/true" });
+  assert.equal(calls("policy").length, 0);
+  assert.equal(calls("reserve").length, 0);
+});
+
+test("POST /gamertag/claim: status codes and response shape (bot-compatible), no secrets", async () => {
+  const ok = await post("/gamertag/claim", { gamertag: "RouteTag" });
+  const okBody = await ok.json() as any;
+  assert.equal(ok.status, 200);
+  assert.equal(okBody.success, true);
+  assert.equal(okBody.state, "claimed");
+  assert.match(okBody.message, /confirmed by Xbox/);
+
+  const taken = await post("/gamertag/claim", { gamertag: "TakenTag" });
+  const tb = await taken.json() as any;
+  assert.equal(taken.status, 409);
+  assert.equal(tb.success, false);
+  assert.equal(tb.error, "taken");
+
+  const bad = await post("/gamertag/claim", { gamertag: "1x" });
+  assert.equal(bad.status, 400);
+
+  await control(mock.url, { queues: { reserve: [{ status: 429, body: {} }] } });
+  const rl = await post("/gamertag/claim", { gamertag: "RateTag" });
+  assert.equal(rl.status, 429);
+  assert.equal(((await rl.json()) as any).state, "rate_limited");
+
+  const all = JSON.stringify(await (await fetch(`${base}/gamertag/claims`)).json()) + JSON.stringify(okBody) + JSON.stringify(tb);
+  assert.ok(!/xsts\||ms-at-|rt-\d|xbl-user-/.test(all), "no token in API responses");
+});
+
+test("GET /auth/xbox/status exposes readiness + masked identity, never tokens", async () => {
+  const st = await (await fetch(`${base}/auth/xbox/status`)).json() as any;
+  assert.equal(st.account.ready, true);
+  assert.equal(st.account.gamertag !== null, true);
+  assert.match(st.account.maskedXuid, /^2533•+0001$/);
+  assert.ok(!/xsts\||ms-at-|rt-|xbl-user-/.test(JSON.stringify(st)));
+});

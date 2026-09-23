@@ -5,15 +5,28 @@
  * "active" and used for gamertag claim/change operations.
  * Any authenticated account (defaulting to active) is used for availability checks.
  *
+ * Chain (all server-side; no token ever reaches the browser):
+ *   Microsoft device code sign-in  → MS refresh token (+ id_token for the email)
+ *   MS access token                → Xbox Live user token (user.auth.xboxlive.com)
+ *   Xbox Live user token           → XSTS token, relying party http://xboxlive.com
+ *   XSTS DisplayClaims.xui[0]      → uhs (user hash), xid (XUID), gtg (gamertag)
+ *
+ * The same http://xboxlive.com XSTS token authorizes both the availability
+ * checks and the gamertag.xboxlive.com reserve/change (claim) calls. XSTS
+ * tokens are bound to their relying party, so a token minted for
+ * http://accounts.xboxlive.com is rejected by gamertag.xboxlive.com.
+ *
  * Storage: .xbox-auth.json (v2 format)
  *   { version: 2, accounts: StoredAccount[], activeAccountId: string | null }
  * Legacy v1 format ({ refreshToken }) is auto-migrated on first load.
+ * Only the refresh token, XUID, gamertag and a MASKED email are stored.
  */
 
 import { logger } from "./logger";
 import fs from "fs";
 import path from "path";
 import crypto from "crypto";
+import { xboxUrl } from "./xbox-http";
 
 // App registration "GT hinter". The client ID is a public identifier (not a
 // secret) and is kept on the server. Override with XBOX_CLIENT_ID.
@@ -23,16 +36,40 @@ const CLIENT_ID = process.env["XBOX_CLIENT_ID"]?.trim() || DEFAULT_CLIENT_ID;
 // XBOX_TENANT_ID only if the app registration is restricted to one tenant.
 const TENANT    = process.env["XBOX_TENANT_ID"]?.trim() || "consumers";
 const SCOPE     = "XboxLive.signin offline_access";
+// Sign-in additionally asks for the standard OpenID scopes so the id_token
+// carries the account's email, shown masked in the UI. Refreshes only need
+// the Xbox scope.
+const SIGNIN_SCOPE = `${SCOPE} openid profile email`;
+
+const TOKEN_URL      = `https://login.microsoftonline.com/${TENANT}/oauth2/v2.0/token`;
+const DEVICECODE_URL = `https://login.microsoftonline.com/${TENANT}/oauth2/v2.0/devicecode`;
+const XBL_AUTH_URL   = "https://user.auth.xboxlive.com/user/authenticate";
+const XSTS_URL       = "https://xsts.auth.xboxlive.com/xsts/authorize";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
+/** Which link of the chain failed (or "ready" when the whole chain succeeded). */
+export type AuthStage = "none" | "microsoft" | "xbox_live" | "xsts" | "xuid" | "ready";
+
+export interface Readiness {
+  ready:     boolean;
+  stage:     AuthStage;
+  /** Human-readable reason when not ready. Never contains a token. */
+  reason:    string | null;
+  /** Xbox XErr code or Microsoft error code, when one was returned. */
+  code:      string | null;
+  checkedAt: number | null;
+}
+
 export interface AccountInfo {
-  id:        string;
-  xuid:      string | null;
-  gamertag:  string | null;
-  addedAt:   number;  // epoch ms
-  isActive:  boolean;
-  xstsReady: boolean;
+  id:          string;
+  xuid:        string | null;
+  gamertag:    string | null;
+  maskedEmail: string | null;
+  addedAt:     number;  // epoch ms
+  isActive:    boolean;
+  xstsReady:   boolean;
+  readiness:   Readiness;
 }
 
 interface AccountState {
@@ -40,15 +77,19 @@ interface AccountState {
   msRefreshToken:  string;
   xuid:            string | null;
   gamertag:        string | null;
+  maskedEmail:     string | null;
   addedAt:         number;
-  // General XSTS (http://xboxlive.com) — for availability checks
+  /** Refresh token was rejected (invalid_grant); the user must sign in again. */
+  revoked:         boolean;
+  // Xbox Live user token — cached so an XSTS re-issue (e.g. to confirm a
+  // claim) doesn't need a Microsoft refresh.
+  xblToken:        string | null;
+  xblExpiry:       number;
+  // XSTS (http://xboxlive.com) — availability checks AND gamertag claims
   xstsToken:       string | null;
   xstsExpiry:      number;
   uhs:             string | null;
-  // Claim XSTS (http://accounts.xboxlive.com) — for gamertag name changes
-  xstsClaimToken:  string | null;
-  xstsClaimExpiry: number;
-  uhsClaim:        string | null;
+  readiness:       Readiness;
 }
 
 // ─── In-memory store ──────────────────────────────────────────────────────────
@@ -59,6 +100,70 @@ let activeAccountId: string | null = null;
 // Per-account in-flight promise — prevents concurrent MS token refreshes.
 // Microsoft refresh tokens are single-use; a second concurrent use invalidates the first.
 const inFlight = new Map<string, Promise<{ token: string; uhs: string } | null>>();
+
+// ─── Masking ──────────────────────────────────────────────────────────────────
+
+/** "john.doe@outlook.com" → "jo•••@o•••.com". Never returns the full address. */
+export function maskEmail(email: string | null | undefined): string | null {
+  if (!email || !email.includes("@")) return null;
+  const [local = "", domain = ""] = email.split("@");
+  const dot = domain.lastIndexOf(".");
+  const host = dot > 0 ? domain.slice(0, dot) : domain;
+  const tld = dot > 0 ? domain.slice(dot) : "";
+  const l = local.length <= 2 ? `${local.slice(0, 1)}•••` : `${local.slice(0, 2)}•••`;
+  return `${l}@${host.slice(0, 1)}•••${tld}`;
+}
+
+/** "2533274812345678" → "2533••••••••5678". */
+export function maskXuid(xuid: string | null | undefined): string | null {
+  if (!xuid) return null;
+  if (xuid.length <= 8) return "••••" + xuid.slice(-2);
+  return `${xuid.slice(0, 4)}${"•".repeat(Math.max(4, xuid.length - 8))}${xuid.slice(-4)}`;
+}
+
+function emailFromIdToken(idToken: string | undefined): string | null {
+  if (!idToken) return null;
+  try {
+    // The id_token came straight from Microsoft's token endpoint over TLS, so
+    // its claims can be read without separate signature validation (OIDC
+    // Core §3.1.3.7). Only the email is used, and only in masked form.
+    const payload = JSON.parse(Buffer.from(idToken.split(".")[1] ?? "", "base64url").toString("utf8")) as {
+      email?: string; preferred_username?: string;
+    };
+    return payload.email ?? payload.preferred_username ?? null;
+  } catch {
+    return null;
+  }
+}
+
+// ─── Xbox error codes ─────────────────────────────────────────────────────────
+
+const XERR_REASONS: Record<string, string> = {
+  "2148916227": "This Xbox account is banned or suspended by Xbox.",
+  "2148916229": "Parental controls block this account from using Xbox Live online.",
+  "2148916233": "This Microsoft account has no Xbox profile yet. Sign in once at xbox.com to create one, then reconnect.",
+  "2148916234": "This account must accept the Xbox terms of use. Sign in at xbox.com, accept, then reconnect.",
+  "2148916235": "Xbox Live is not available in this account's country/region.",
+  "2148916236": "This account needs adult (age) verification before it can use Xbox Live.",
+  "2148916237": "This account needs age verification before it can use Xbox Live.",
+  "2148916238": "This is a child account. An adult must add it to a Microsoft family before it can use Xbox Live.",
+};
+
+function parseXErr(bodyText: string): string | null {
+  try {
+    const body = JSON.parse(bodyText) as { XErr?: number | string };
+    return body.XErr !== undefined ? String(body.XErr) : null;
+  } catch { return null; /* no JSON body */ }
+}
+
+function describeXboxAuthFailure(res: { status: number }, bodyText: string, what: string): { reason: string; code: string | null } {
+  const xerr = parseXErr(bodyText);
+  if (xerr && XERR_REASONS[xerr]) return { reason: XERR_REASONS[xerr]!, code: xerr };
+  return {
+    reason: `${what} was refused by Xbox (HTTP ${res.status}${xerr ? `, XErr ${xerr}` : ""}).`,
+    code: xerr,
+  };
+}
 
 // ─── Persistence ─────────────────────────────────────────────────────────────
 
@@ -74,6 +179,7 @@ interface StoredAccount {
   id:             string;
   xuid:           string | null;
   gamertag:       string | null;
+  maskedEmail?:   string | null;
   addedAt:        number;
   msRefreshToken: string;
 }
@@ -83,29 +189,35 @@ function persistAccounts(): void {
     const data: StoredV2 = {
       version: 2,
       activeAccountId,
-      accounts: [...accounts.values()].map((a) => ({
+      accounts: [...accounts.values()].filter((a) => !a.revoked).map((a) => ({
         id:             a.id,
         xuid:           a.xuid,
         gamertag:       a.gamertag,
+        maskedEmail:    a.maskedEmail,
         addedAt:        a.addedAt,
         msRefreshToken: a.msRefreshToken,
       })),
     };
-    fs.writeFileSync(AUTH_FILE, JSON.stringify(data, null, 2), "utf8");
+    // 0600: the file holds refresh tokens.
+    fs.writeFileSync(AUTH_FILE, JSON.stringify(data, null, 2), { encoding: "utf8", mode: 0o600 });
   } catch { /* non-critical */ }
 }
+
+const NOT_CHECKED: Readiness = { ready: false, stage: "none", reason: "Not verified yet.", code: null, checkedAt: null };
 
 function makeAccount(
   id: string,
   msRefreshToken: string,
   addedAt: number,
-  xuid:     string | null = null,
-  gamertag: string | null = null,
+  xuid:        string | null = null,
+  gamertag:    string | null = null,
+  maskedEmail: string | null = null,
 ): AccountState {
   return {
-    id, msRefreshToken, addedAt, xuid, gamertag,
+    id, msRefreshToken, addedAt, xuid, gamertag, maskedEmail, revoked: false,
+    xblToken: null, xblExpiry: 0,
     xstsToken: null, xstsExpiry: 0, uhs: null,
-    xstsClaimToken: null, xstsClaimExpiry: 0, uhsClaim: null,
+    readiness: { ...NOT_CHECKED },
   };
 }
 
@@ -132,7 +244,9 @@ function loadAccounts(): void {
     if (data["version"] === 2) {
       const v2 = data as unknown as StoredV2;
       for (const stored of v2.accounts) {
-        accounts.set(stored.id, makeAccount(stored.id, stored.msRefreshToken, stored.addedAt, stored.xuid, stored.gamertag));
+        accounts.set(stored.id, makeAccount(
+          stored.id, stored.msRefreshToken, stored.addedAt, stored.xuid, stored.gamertag, stored.maskedEmail ?? null,
+        ));
       }
       activeAccountId = v2.activeAccountId ?? null;
       // Sanitise: if saved activeAccountId is gone, fall back to first account
@@ -152,9 +266,17 @@ function loadAccounts(): void {
 
 loadAccounts();
 
+function setReadiness(account: AccountState, stage: AuthStage, reason: string | null, code: string | null = null): void {
+  account.readiness = { ready: stage === "ready", stage, reason, code, checkedAt: Date.now() };
+}
+
 // ─── Microsoft token refresh ──────────────────────────────────────────────────
 
 async function refreshMsToken(account: AccountState): Promise<string | null> {
+  if (account.revoked) {
+    setReadiness(account, "microsoft", "Microsoft sign-in expired or was revoked. Connect Xbox again.", "invalid_grant");
+    return null;
+  }
   const body = new URLSearchParams({
     client_id:     CLIENT_ID,
     grant_type:    "refresh_token",
@@ -164,7 +286,7 @@ async function refreshMsToken(account: AccountState): Promise<string | null> {
 
   try {
     const res = await fetch(
-      `https://login.microsoftonline.com/${TENANT}/oauth2/v2.0/token`,
+      xboxUrl(TOKEN_URL),
       {
         method:  "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -182,17 +304,21 @@ async function refreshMsToken(account: AccountState): Promise<string | null> {
         } catch { /* ignore */ }
 
         if (errCode === "invalid_grant" || errCode === "expired_token") {
-          logger.warn({ accountId: account.id, error: errCode }, "MS refresh token revoked — removing account");
-          accounts.delete(account.id);
-          if (activeAccountId === account.id) {
-            activeAccountId = accounts.keys().next().value ?? null;
-          }
+          // Keep the account (without its dead token on disk) so the UI can
+          // say exactly why it is not ready; a new sign-in replaces it.
+          logger.warn({ accountId: account.id, error: errCode }, "MS refresh token revoked — account needs a new sign-in");
+          account.revoked = true;
+          account.xstsToken = null;
+          account.xblToken = null;
           persistAccounts();
+          setReadiness(account, "microsoft", "Microsoft sign-in expired or was revoked. Connect Xbox again.", errCode);
         } else {
           logger.warn({ accountId: account.id, status: res.status, error: errCode }, "MS token refresh rejected — retaining for retry");
+          setReadiness(account, "microsoft", `Microsoft rejected the token refresh (HTTP ${res.status}${errCode ? `, ${errCode}` : ""}).`, errCode || null);
         }
       } else {
         logger.warn({ accountId: account.id, status: res.status }, "MS token refresh server error (transient) — retaining");
+        setReadiness(account, "microsoft", `Microsoft sign-in service error (HTTP ${res.status}). Will retry.`);
       }
       return null;
     }
@@ -203,22 +329,24 @@ async function refreshMsToken(account: AccountState): Promise<string | null> {
     logger.info({ accountId: account.id }, "MS refresh token rotated and persisted");
     return data.access_token;
   } catch (err) {
-    logger.warn({ accountId: account.id, err }, "MS token refresh network error — retaining");
+    logger.warn({ accountId: account.id, errName: err instanceof Error ? err.name : "unknown" }, "MS token refresh network error — retaining");
+    setReadiness(account, "microsoft", "Could not reach Microsoft sign-in (network error). Will retry.");
     return null;
   }
 }
 
-// ─── XSTS fetch ───────────────────────────────────────────────────────────────
+// ─── Xbox Live user token ─────────────────────────────────────────────────────
 
-async function _doFetchXsts(account: AccountState): Promise<{ token: string; uhs: string } | null> {
+async function getXblToken(account: AccountState, allowCached: boolean): Promise<string | null> {
+  if (allowCached && account.xblToken && Date.now() < account.xblExpiry - 5 * 60_000) return account.xblToken;
+
   const msToken = await refreshMsToken(account);
   if (!msToken) return null;
 
   try {
-    // Exchange MS token → XBL token
-    const xblRes = await fetch("https://user.auth.xboxlive.com/user/authenticate", {
+    const xblRes = await fetch(xboxUrl(XBL_AUTH_URL), {
       method:  "POST",
-      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      headers: { "Content-Type": "application/json", Accept: "application/json", "x-xbl-contract-version": "1" },
       body: JSON.stringify({
         Properties:   { AuthMethod: "RPS", SiteName: "user.auth.xboxlive.com", RpsTicket: `d=${msToken}` },
         RelyingParty: "http://auth.xboxlive.com",
@@ -227,85 +355,114 @@ async function _doFetchXsts(account: AccountState): Promise<{ token: string; uhs
       signal: AbortSignal.timeout(10_000),
     });
     if (!xblRes.ok) {
-      logger.warn({ accountId: account.id, status: xblRes.status }, "XBL auth failed");
+      const { reason, code } = describeXboxAuthFailure(xblRes, await xblRes.text().catch(() => ""), "Xbox Live sign-in");
+      account.xblToken = null;
+      account.xstsToken = null;
+      logger.warn({ accountId: account.id, status: xblRes.status, code }, "XBL auth failed");
+      setReadiness(account, "xbox_live", reason, code);
       return null;
     }
-    const xblData  = (await xblRes.json()) as { Token: string; DisplayClaims: { xui: [{ uhs: string }] } };
-    const xblToken = xblData.Token;
-    const uhs      = xblData.DisplayClaims.xui[0]!.uhs;
-
-    // Exchange XBL token → two XSTS tokens in parallel:
-    //   1. http://xboxlive.com          — general API calls (checking)
-    //   2. http://accounts.xboxlive.com — gamertag claim/change endpoint
-    const xstsBody = (rp: string) => JSON.stringify({
-      Properties:   { SandboxId: "RETAIL", UserTokens: [xblToken] },
-      RelyingParty: rp,
-      TokenType:    "JWT",
-    });
-
-    const [xstsRes, xstsClaimRes] = await Promise.all([
-      fetch("https://xsts.auth.xboxlive.com/xsts/authorize", {
-        method: "POST", headers: { "Content-Type": "application/json", Accept: "application/json" },
-        body: xstsBody("http://xboxlive.com"), signal: AbortSignal.timeout(10_000),
-      }),
-      fetch("https://xsts.auth.xboxlive.com/xsts/authorize", {
-        method: "POST", headers: { "Content-Type": "application/json", Accept: "application/json" },
-        body: xstsBody("http://accounts.xboxlive.com"), signal: AbortSignal.timeout(10_000),
-      }),
-    ]);
-
-    if (!xstsRes.ok) {
-      logger.warn({ accountId: account.id, status: xstsRes.status }, "XSTS auth failed (xboxlive.com)");
+    const xblData = (await xblRes.json()) as { Token?: string; NotAfter?: string };
+    if (!xblData.Token) {
+      setReadiness(account, "xbox_live", "Xbox Live sign-in returned no token.");
       return null;
     }
-    const xstsData = (await xstsRes.json()) as {
-      Token: string; NotAfter: string;
-      DisplayClaims?: { xui?: Array<{ uhs?: string; xid?: string }> };
-    };
-    account.xstsToken  = xstsData.Token;
-    account.uhs        = uhs;
-    account.xstsExpiry = new Date(xstsData.NotAfter).getTime();
-
-    const xuiClaims = xstsData.DisplayClaims?.xui;
-    if (xuiClaims?.[0]?.xid && !account.xuid) {
-      account.xuid = xuiClaims[0].xid;
-      persistAccounts();
-    }
-
-    // Cache claim XSTS (best-effort — checking still works without it)
-    if (xstsClaimRes.ok) {
-      try {
-        const claimData = (await xstsClaimRes.json()) as {
-          Token: string; NotAfter: string;
-          DisplayClaims?: { xui?: Array<{ uhs?: string }> };
-        };
-        account.xstsClaimToken  = claimData.Token;
-        account.xstsClaimExpiry = new Date(claimData.NotAfter).getTime();
-        account.uhsClaim        = claimData.DisplayClaims?.xui?.[0]?.uhs ?? uhs;
-        logger.info({ accountId: account.id, expiresAt: claimData.NotAfter }, "✅ Claim XSTS token obtained (accounts.xboxlive.com)");
-      } catch {
-        logger.warn({ accountId: account.id }, "Failed to parse claim XSTS response");
-      }
-    } else {
-      const body = await xstsClaimRes.text().catch(() => "");
-      logger.warn({ accountId: account.id, status: xstsClaimRes.status, body }, "Claim XSTS failed");
-    }
-
-    logger.info({ accountId: account.id, expiresAt: xstsData.NotAfter }, "✅ XSTS token obtained — ready for Xbox API calls");
-    return { token: account.xstsToken, uhs };
+    account.xblToken  = xblData.Token;
+    account.xblExpiry = xblData.NotAfter ? new Date(xblData.NotAfter).getTime() : Date.now() + 60 * 60_000;
+    return account.xblToken;
   } catch (err) {
-    logger.warn({ accountId: account.id, err }, "XSTS fetch error");
+    logger.warn({ accountId: account.id, errName: err instanceof Error ? err.name : "unknown" }, "XBL auth network error");
+    setReadiness(account, "xbox_live", "Could not reach Xbox Live sign-in (network error). Will retry.");
     return null;
   }
 }
 
-async function fetchXstsForAccount(id: string): Promise<{ token: string; uhs: string } | null> {
+// ─── XSTS fetch ───────────────────────────────────────────────────────────────
+
+async function _doFetchXsts(account: AccountState, allowCachedXbl = true): Promise<{ token: string; uhs: string } | null> {
+  let xblToken = await getXblToken(account, allowCachedXbl);
+  if (!xblToken) return null;
+
+  try {
+    const requestXsts = (userToken: string) => fetch(xboxUrl(XSTS_URL), {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json", "x-xbl-contract-version": "1" },
+      body: JSON.stringify({
+        Properties:   { SandboxId: "RETAIL", UserTokens: [userToken] },
+        RelyingParty: "http://xboxlive.com",
+        TokenType:    "JWT",
+      }),
+      signal: AbortSignal.timeout(10_000),
+    });
+
+    let xstsRes = await requestXsts(xblToken);
+    let xstsText = xstsRes.ok ? "" : await xstsRes.text().catch(() => "");
+    // A cached user token may have been invalidated server-side; retry once
+    // with a freshly minted one. A 401 carrying an XErr is an account-level
+    // refusal (no profile, child account, ...) that a new token can't fix.
+    if (xstsRes.status === 401 && allowCachedXbl && !parseXErr(xstsText)) {
+      account.xblToken = null;
+      xblToken = await getXblToken(account, false);
+      if (!xblToken) return null;
+      xstsRes = await requestXsts(xblToken);
+      xstsText = xstsRes.ok ? "" : await xstsRes.text().catch(() => "");
+    }
+
+    if (!xstsRes.ok) {
+      const { reason, code } = describeXboxAuthFailure(xstsRes, xstsText, "XSTS authorization");
+      // Xbox refused this account: a previously cached token must not keep
+      // claims working while the account is reported as not ready.
+      account.xstsToken = null;
+      logger.warn({ accountId: account.id, status: xstsRes.status, code }, "XSTS auth failed (xboxlive.com)");
+      setReadiness(account, "xsts", reason, code);
+      return null;
+    }
+    const xstsData = (await xstsRes.json()) as {
+      Token: string; NotAfter: string;
+      DisplayClaims?: { xui?: Array<{ uhs?: string; xid?: string; gtg?: string }> };
+    };
+    const claims = xstsData.DisplayClaims?.xui?.[0];
+    if (!xstsData.Token || !claims?.uhs) {
+      setReadiness(account, "xsts", "XSTS response did not include a user hash.");
+      return null;
+    }
+    account.xstsToken  = xstsData.Token;
+    account.uhs        = claims.uhs;
+    account.xstsExpiry = new Date(xstsData.NotAfter).getTime();
+
+    // XUID and gamertag come from the XSTS display claims. They are refreshed
+    // on every issue, so a successful gamertag change is reflected here.
+    let changed = false;
+    if (claims.xid && claims.xid !== account.xuid) { account.xuid = claims.xid; changed = true; }
+    if (claims.gtg && claims.gtg !== account.gamertag) { account.gamertag = claims.gtg; changed = true; }
+    if (changed) persistAccounts();
+
+    if (!account.xuid) {
+      setReadiness(account, "xuid", "Xbox did not return an XUID for this account, so it cannot claim gamertags.");
+    } else {
+      setReadiness(account, "ready", null);
+    }
+
+    logger.info({ accountId: account.id, expiresAt: xstsData.NotAfter }, "✅ XSTS token obtained — ready for Xbox API calls");
+    return { token: account.xstsToken, uhs: account.uhs };
+  } catch (err) {
+    logger.warn({ accountId: account.id, errName: err instanceof Error ? err.name : "unknown" }, "XSTS fetch error");
+    setReadiness(account, "xsts", "Could not reach Xbox XSTS (network error). Will retry.");
+    return null;
+  }
+}
+
+function xstsValid(a: AccountState): boolean {
+  return !!(a.xstsToken && a.uhs && Date.now() < a.xstsExpiry - 5 * 60_000);
+}
+
+async function fetchXstsForAccount(id: string, force = false): Promise<{ token: string; uhs: string } | null> {
   const account = accounts.get(id);
-  if (!account) return null;
+  if (!account || account.revoked) return null;
 
   // Return cached if still valid (5-min buffer)
-  if (account.xstsToken && account.uhs && Date.now() < account.xstsExpiry - 5 * 60_000) {
-    return { token: account.xstsToken, uhs: account.uhs };
+  if (!force && xstsValid(account)) {
+    return { token: account.xstsToken!, uhs: account.uhs! };
   }
 
   const existing = inFlight.get(id);
@@ -320,14 +477,13 @@ async function fetchXstsForAccount(id: string): Promise<{ token: string; uhs: st
 
 setInterval(() => {
   for (const [id, account] of accounts.entries()) {
-    const needsRefresh =
-      account.xstsExpiry      === 0 || Date.now() > account.xstsExpiry      - 10 * 60_000 ||
-      account.xstsClaimExpiry === 0 || Date.now() > account.xstsClaimExpiry - 10 * 60_000;
+    if (account.revoked) continue;
+    const needsRefresh = account.xstsExpiry === 0 || Date.now() > account.xstsExpiry - 10 * 60_000;
     if (needsRefresh && !inFlight.has(id)) {
       fetchXstsForAccount(id).catch((err) => logger.warn({ accountId: id, err }, "Proactive XSTS refresh error"));
     }
   }
-}, 60_000);
+}, 60_000).unref();
 
 // ─── Device code flow ─────────────────────────────────────────────────────────
 
@@ -336,6 +492,8 @@ export interface DeviceCodeInfo {
   verificationUri: string;
   expiresAt:       number;
   status:          "pending" | "authorized" | "expired" | "error";
+  /** Microsoft's error code when status is "error" (e.g. access_denied). */
+  error?:          string;
 }
 
 let dcState: DeviceCodeInfo | null = null;
@@ -354,7 +512,7 @@ async function pollLoop(): Promise<void> {
 
     try {
       const res = await fetch(
-        `https://login.microsoftonline.com/${TENANT}/oauth2/v2.0/token`,
+        xboxUrl(TOKEN_URL),
         {
           method:  "POST",
           headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -362,18 +520,25 @@ async function pollLoop(): Promise<void> {
           signal:  AbortSignal.timeout(10_000),
         },
       );
-      const data = (await res.json()) as { error?: string; access_token?: string; refresh_token?: string };
+      const data = (await res.json()) as { error?: string; access_token?: string; refresh_token?: string; id_token?: string };
 
-      if (data.error === "authorization_pending" || data.error === "slow_down") continue;
+      if (data.error === "authorization_pending") continue;
+      if (data.error === "slow_down") { dcInterval += 5_000; continue; }
       if (data.error) {
         logger.warn({ error: data.error }, "Device code flow error");
-        if (dcState) dcState.status = "error";
+        if (dcState) { dcState.status = "error"; dcState.error = data.error; }
         return;
       }
 
       if (data.access_token && data.refresh_token) {
+        // A new sign-in replaces any account whose Microsoft sign-in was revoked.
+        for (const [oldId, old] of accounts) {
+          if (old.revoked) accounts.delete(oldId);
+        }
+        if (activeAccountId && !accounts.has(activeAccountId)) activeAccountId = null;
+
         const id      = crypto.randomUUID();
-        const account = makeAccount(id, data.refresh_token, Date.now());
+        const account = makeAccount(id, data.refresh_token, Date.now(), null, null, maskEmail(emailFromIdToken(data.id_token)));
         accounts.set(id, account);
 
         // First account (or only one) becomes active automatically
@@ -383,7 +548,7 @@ async function pollLoop(): Promise<void> {
         if (dcState) dcState.status = "authorized";
         logger.info({ accountId: id }, "✅ New Xbox account added");
 
-        // Pre-warm XSTS in background
+        // Resolve Xbox Live → XSTS → XUID right away so readiness is known.
         fetchXstsForAccount(id).catch(() => {});
         return;
       }
@@ -401,9 +566,9 @@ export async function startDeviceCodeFlow(): Promise<DeviceCodeInfo> {
 
   if (dcState?.status === "pending" && Date.now() < dcState.expiresAt) return dcState;
 
-  const body = new URLSearchParams({ client_id: CLIENT_ID, scope: SCOPE });
+  const body = new URLSearchParams({ client_id: CLIENT_ID, scope: SIGNIN_SCOPE });
   const res  = await fetch(
-    `https://login.microsoftonline.com/${TENANT}/oauth2/v2.0/devicecode`,
+    xboxUrl(DEVICECODE_URL),
     {
       method:  "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -414,7 +579,7 @@ export async function startDeviceCodeFlow(): Promise<DeviceCodeInfo> {
 
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(`Device code request failed (${res.status}): ${text}`);
+    throw new Error(`Device code request failed (${res.status}): ${text.slice(0, 300)}`);
   }
 
   const data = (await res.json()) as {
@@ -431,7 +596,7 @@ export async function startDeviceCodeFlow(): Promise<DeviceCodeInfo> {
     status:          "pending",
   };
 
-  logger.info({ verificationUri: dcState.verificationUri, userCode: dcState.userCode }, "Device code flow started");
+  logger.info({ verificationUri: dcState.verificationUri }, "Device code flow started");
   pollLoop().catch((err) => logger.error({ err }, "Poll loop error"));
   return dcState;
 }
@@ -442,12 +607,14 @@ export function getDeviceCodeState(): DeviceCodeInfo | null { return dcState; }
 
 export function getAccountInfoList(): AccountInfo[] {
   return [...accounts.values()].map((a) => ({
-    id:        a.id,
-    xuid:      a.xuid,
-    gamertag:  a.gamertag,
-    addedAt:   a.addedAt,
-    isActive:  a.id === activeAccountId,
-    xstsReady: !!(a.xstsToken && a.uhs && Date.now() < a.xstsExpiry - 5 * 60_000),
+    id:          a.id,
+    xuid:        a.xuid,
+    gamertag:    a.gamertag,
+    maskedEmail: a.maskedEmail,
+    addedAt:     a.addedAt,
+    isActive:    a.id === activeAccountId,
+    xstsReady:   xstsValid(a),
+    readiness:   a.readiness,
   }));
 }
 
@@ -481,7 +648,7 @@ export function logoutAllAccounts(): void {
   activeAccountId = null;
   try {
     const empty = { version: 2, accounts: [], activeAccountId: null };
-    fs.writeFileSync(AUTH_FILE, JSON.stringify(empty, null, 2), "utf8");
+    fs.writeFileSync(AUTH_FILE, JSON.stringify(empty, null, 2), { encoding: "utf8", mode: 0o600 });
   } catch { /* non-critical */ }
   logger.info("All Xbox accounts signed out");
 }
@@ -495,22 +662,91 @@ export async function getAuthHeader(): Promise<string | null> {
   return `XBL3.0 x=${xsts.uhs};${xsts.token}`;
 }
 
-/**
- * Auth header scoped to http://accounts.xboxlive.com for claim/change operations.
- * Strictly uses the active account.
- */
-export async function getClaimAuthHeader(): Promise<string | null> {
-  if (!activeAccountId) return null;
-  await fetchXstsForAccount(activeAccountId);
-  const account = accounts.get(activeAccountId);
-  if (!account) return null;
+/** Everything a claim needs, for the active account — or the exact reason it isn't available. */
+export type ClaimContext =
+  | { ok: true; accountId: string; authHeader: string; xuid: string; gamertag: string | null }
+  | { ok: false; stage: AuthStage; reason: string; code: string | null };
 
-  if (account.xstsClaimToken && account.uhsClaim && Date.now() < account.xstsClaimExpiry - 5 * 60_000) {
-    return `XBL3.0 x=${account.uhsClaim};${account.xstsClaimToken}`;
+export async function getClaimContext(): Promise<ClaimContext> {
+  if (!activeAccountId) {
+    return { ok: false, stage: "none", reason: "No Xbox account connected. Connect Xbox first.", code: null };
   }
+  const account = accounts.get(activeAccountId);
+  if (!account) return { ok: false, stage: "none", reason: "No Xbox account connected. Connect Xbox first.", code: null };
+  const xsts = await fetchXstsForAccount(activeAccountId);
+  if (!xsts) {
+    return {
+      ok: false,
+      stage: account.readiness.stage,
+      reason: account.readiness.reason ?? "Xbox authentication failed.",
+      code: account.readiness.code,
+    };
+  }
+  if (!account.xuid) {
+    return { ok: false, stage: "xuid", reason: "Xbox did not return an XUID for this account, so it cannot claim gamertags.", code: null };
+  }
+  return {
+    ok: true,
+    accountId: account.id,
+    authHeader: `XBL3.0 x=${xsts.uhs};${xsts.token}`,
+    xuid: account.xuid,
+    gamertag: account.gamertag,
+  };
+}
 
-  logger.warn({ accountId: activeAccountId }, "Claim XSTS unavailable — falling back to general token");
-  return getAuthHeader();
+/**
+ * Re-issues the active account's XSTS token (reusing the cached Xbox Live user
+ * token when possible) and returns the gamertag Xbox now reports for it.
+ * Used to independently confirm a claim; also used by "Verify" in the UI.
+ */
+export async function refreshActiveIdentity(): Promise<{ ok: boolean; gamertag: string | null; xuid: string | null }> {
+  if (!activeAccountId) return { ok: false, gamertag: null, xuid: null };
+  const account = accounts.get(activeAccountId);
+  if (!account) return { ok: false, gamertag: null, xuid: null };
+  const r = await fetchXstsForAccount(activeAccountId, true);
+  return { ok: r !== null, gamertag: account.gamertag, xuid: account.xuid };
+}
+
+/** Active-account readiness plus display-safe identity. */
+export interface ActiveAccountStatus {
+  connected:   boolean;
+  ready:       boolean;
+  stage:       AuthStage;
+  reason:      string | null;
+  code:        string | null;
+  checkedAt:   number | null;
+  maskedEmail: string | null;
+  gamertag:    string | null;
+  maskedXuid:  string | null;
+}
+
+export function getActiveAccountStatus(): ActiveAccountStatus {
+  const account = activeAccountId ? accounts.get(activeAccountId) : undefined;
+  if (!account) {
+    return {
+      connected: false, ready: false, stage: "none", reason: "No Xbox account connected.", code: null,
+      checkedAt: null, maskedEmail: null, gamertag: null, maskedXuid: null,
+    };
+  }
+  // A cached token that has since expired is not "ready" until re-verified.
+  const ready = account.readiness.ready && xstsValid(account) && !!account.xuid;
+  return {
+    connected:   !account.revoked,
+    ready,
+    stage:       ready ? "ready" : account.readiness.stage,
+    reason:      ready ? null : (account.readiness.reason ?? "Not verified yet."),
+    code:        ready ? null : account.readiness.code,
+    checkedAt:   account.readiness.checkedAt,
+    maskedEmail: account.maskedEmail,
+    gamertag:    account.gamertag,
+    maskedXuid:  maskXuid(account.xuid),
+  };
+}
+
+/** Runs the full chain now (using cached tokens when valid) and returns the result. */
+export async function verifyActiveAccount(): Promise<ActiveAccountStatus> {
+  if (activeAccountId) await fetchXstsForAccount(activeAccountId);
+  return getActiveAccountStatus();
 }
 
 /** XUID of the active account (used for claim URLs). */
@@ -519,12 +755,15 @@ export function getXuid(): string | null {
   return accounts.get(activeAccountId)?.xuid ?? null;
 }
 
-export function isAuthenticated(): boolean { return accounts.size > 0; }
+export function isAuthenticated(): boolean {
+  for (const a of accounts.values()) if (!a.revoked) return true;
+  return false;
+}
 
 export function isXstsReady(): boolean {
   if (!activeAccountId) return false;
   const a = accounts.get(activeAccountId);
-  return !!(a?.xstsToken && a?.uhs && Date.now() < a.xstsExpiry - 5 * 60_000);
+  return !!a && xstsValid(a);
 }
 
 export function preWarmXboxAuth(): void {

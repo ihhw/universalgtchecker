@@ -1,5 +1,6 @@
 import { Router, type IRouter } from "express";
-import { isAuthenticated, isXstsReady } from "../lib/xbox-auth";
+import { getActiveAccountStatus, isAuthenticated, isXstsReady } from "../lib/xbox-auth";
+import { sniperStats } from "../lib/xbox-sniper";
 import { activityClientCount } from "../lib/activity";
 import { getBotStatus } from "../lib/bot-status";
 import { getSessionStats } from "./gamertag";
@@ -58,7 +59,8 @@ router.get("/status", async (_req, res): Promise<void> => {
   } else if (authed && isXstsReady()) {
     xbox = { id: "xbox", label: "Xbox API", state: "online", detail: "Signed in" };
   } else if (authed) {
-    xbox = { id: "xbox", label: "Xbox API", state: "degraded", detail: "Signed in, token refresh pending" };
+    const acct = getActiveAccountStatus();
+    xbox = { id: "xbox", label: "Xbox API", state: "degraded", detail: `Signed in, not ready: ${acct.reason ?? "token refresh pending"}` };
   } else {
     xbox = { id: "xbox", label: "Xbox API", state: "degraded", detail: "Not signed in, using CDN fallback" };
   }
@@ -70,7 +72,7 @@ router.get("/status", async (_req, res): Promise<void> => {
       id: "engine",
       label: "Checker engine",
       state: "online",
-      detail: `${stats.running} search${stats.running === 1 ? "" : "es"} running`,
+      detail: `${stats.running} search${stats.running === 1 ? "" : "es"} running${sniperStats().running ? " · sniper watching" : ""}`,
     },
     {
       id: "realtime",

@@ -2,28 +2,45 @@ import { Router, type IRouter } from "express";
 import {
   startDeviceCodeFlow,
   getDeviceCodeState,
+  getActiveAccountStatus,
   isAuthenticated,
   isXstsReady,
   logoutAllAccounts,
+  verifyActiveAccount,
 } from "../lib/xbox-auth";
 
 const router: IRouter = Router();
 
-/** GET /api/auth/xbox/status — current auth state */
+/**
+ * GET /api/auth/xbox/status — current auth state.
+ *
+ * `authenticated` only means a Microsoft sign-in exists. `account.ready` is
+ * true only when the whole chain (Microsoft → Xbox Live → XSTS → XUID)
+ * succeeded; otherwise `account.reason` says which link failed. No token is
+ * ever included — only a masked email, the gamertag and a masked XUID.
+ */
 router.get("/auth/xbox/status", (_req, res): void => {
   const state = getDeviceCodeState();
   res.json({
     authenticated: isAuthenticated(),
     xstsReady:     isXstsReady(),
+    account:       getActiveAccountStatus(),
     deviceCode: state
       ? {
           userCode:        state.userCode,
           verificationUri: state.verificationUri,
           status:          state.status,
           expiresAt:       state.expiresAt,
+          error:           state.error,
         }
       : null,
   });
+});
+
+/** POST /api/auth/xbox/verify — run the auth chain now and report readiness. */
+router.post("/auth/xbox/verify", async (_req, res): Promise<void> => {
+  const account = await verifyActiveAccount();
+  res.json({ authenticated: isAuthenticated(), xstsReady: isXstsReady(), account });
 });
 
 /** POST /api/auth/xbox/start — begin device code flow */

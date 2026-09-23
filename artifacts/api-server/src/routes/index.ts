@@ -6,6 +6,7 @@ import activityRouter from "./activity";
 import settingsRouter from "./settings";
 import statusRouter   from "./status";
 import botRouter      from "./bot";
+import sniperRouter   from "./sniper";
 
 const router: IRouter = Router();
 
@@ -16,5 +17,6 @@ router.use(activityRouter);
 router.use(settingsRouter);
 router.use(statusRouter);
 router.use(botRouter);
+router.use(sniperRouter);
 
 export default router;
