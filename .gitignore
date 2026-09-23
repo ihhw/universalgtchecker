@@ -8,6 +8,9 @@ out-tsc
 .expo
 .expo-shared
 
+# packaged build artifacts
+*.deb
+
 # dependencies
 node_modules
 
