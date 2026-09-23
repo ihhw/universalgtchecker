@@ -5,6 +5,7 @@ import { Toaster } from "sonner";
 import { AppShell } from "@/components/app-shell";
 import { CheckerProvider } from "@/state/checker";
 import HomePage from "@/pages/home";
+import DiagnosticsPage from "@/pages/diagnostics";
 import XboxPage from "@/pages/xbox";
 import SniperPage from "@/pages/sniper";
 import HitsPage from "@/pages/hits";
@@ -33,6 +34,7 @@ function Routes() {
       </Route>
       <Route path="/activity" component={ActivityPage} />
       <Route path="/status" component={StatusPage} />
+      <Route path="/diagnostics" component={DiagnosticsPage} />
       <Route path="/settings" component={SettingsPage} />
       <Route component={NotFound} />
     </Switch>

@@ -25,6 +25,7 @@ const WORKSPACE: NavItem[] = [
   { label: "Analytics", href: "/analytics" },
   { label: "Live activity", href: "/activity" },
   { label: "System status", href: "/status" },
+  { label: "Diagnostics", href: "/diagnostics" },
   { label: "Settings", href: "/settings" },
 ];
 
