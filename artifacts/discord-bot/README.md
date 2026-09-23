@@ -10,7 +10,12 @@ Set these environment variables:
 
 - `DISCORD_BOT_TOKEN` — store this as a server secret. Never commit it or paste it into chat; if it is ever exposed, reset it in the Discord Developer Portal.
 - `DISCORD_CHANNEL_ID` — optional numeric channel ID. When set, commands and
-  alerts are restricted to that channel.
+  alerts are restricted to that channel (slash commands included).
+- `DISCORD_REQUIRED_ROLE_ID` — optional numeric role ID. When set, only
+  members with that role can run any bot command (prefix or slash); everyone
+  else is silently ignored in the wrong channel, or told they lack
+  permission if the channel matches but the role doesn't. Leave unset for no
+  role restriction, same as the default for `DISCORD_CHANNEL_ID`.
 - `GAMERTAG_API_URL` — optional API base URL; defaults to
   `http://127.0.0.1:8080/api`.
 

@@ -22,6 +22,9 @@ log = logging.getLogger("gtaghunter.discord")
 API_BASE = os.getenv("GAMERTAG_API_URL", "http://127.0.0.1:8080/api").rstrip("/")
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID", "0") or "0")
+# Optional role gate for every bot command (prefix and slash alike). Unset
+# (0) means unrestricted, matching CHANNEL_ID's own default-off behaviour.
+REQUIRED_ROLE_ID = int(os.getenv("DISCORD_REQUIRED_ROLE_ID", "0") or "0")
 # Remote-control presets. Each maps a short name to a generation config for the
 # API, which validates it (Xbox gamertags are 3-15 characters and start with a
 # letter). The full mode system is available in the web app.
@@ -48,6 +51,43 @@ MAX_RATE = 1000
 SEARCH_STATE_PATH = Path(__file__).with_name("search_state.json")
 
 
+def has_required_role_ids(role_ids: "list[int] | frozenset[int]", required_role_id: int = REQUIRED_ROLE_ID) -> bool:
+    """Pure permission check, kept free of any Discord object so it's unit-testable."""
+    if not required_role_id:
+        return True
+    return required_role_id in set(role_ids)
+
+
+def member_role_ids(user: "discord.abc.User | discord.Member") -> list[int]:
+    """A plain discord.User (e.g. in a DM) has no .roles; treat that as no roles."""
+    roles = getattr(user, "roles", None)
+    return [role.id for role in roles] if roles else []
+
+
+def has_required_role(user: "discord.abc.User | discord.Member") -> bool:
+    return has_required_role_ids(member_role_ids(user))
+
+
+class PermissionedTree(app_commands.CommandTree):
+    """Applies the same channel + role gate to slash commands that prefix
+    commands already get from the `allowed_channel` check below. Slash
+    commands previously ignored DISCORD_CHANNEL_ID entirely — closing that
+    gap here, not just adding the new role gate."""
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if CHANNEL_ID and interaction.channel_id != CHANNEL_ID:
+            return False  # silent, matching the existing channel gate's behaviour
+        if not has_required_role(interaction.user):
+            try:
+                await interaction.response.send_message(
+                    "You don't have permission to use this command.", ephemeral=True
+                )
+            except discord.HTTPException:
+                log.exception("Could not report a permission denial to Discord")
+            return False
+        return True
+
+
 @dataclass
 class SearchSession:
     session_id: str
@@ -64,7 +104,7 @@ class GTagHunterBot(commands.Bot):
         # Slash commands work with the default gateway intents. Prefix commands
         # are opt-in because Discord requires Message Content Intent for them.
         intents.message_content = os.getenv("DISCORD_ENABLE_PREFIX_COMMANDS", "").lower() == "true"
-        super().__init__(command_prefix="!", intents=intents)
+        super().__init__(command_prefix="!", intents=intents, tree_cls=PermissionedTree)
         self.api_http: aiohttp.ClientSession | None = None
         self.sessions: dict[int, SearchSession] = {}
         self.restore_task: asyncio.Task[None] | None = None
@@ -327,7 +367,9 @@ bot = GTagHunterBot()
 
 @bot.check
 async def allowed_channel(ctx: commands.Context[commands.Bot]) -> bool:
-    return not CHANNEL_ID or ctx.channel.id == CHANNEL_ID
+    if CHANNEL_ID and ctx.channel.id != CHANNEL_ID:
+        return False
+    return has_required_role(ctx.author)
 
 
 async def start_search_for_channel(

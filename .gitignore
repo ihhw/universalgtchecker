@@ -65,3 +65,8 @@ sniper.json
 # Analytics counters persisted state (runtime)
 artifacts/api-server/stats.json
 stats.json
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
