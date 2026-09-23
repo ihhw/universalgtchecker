@@ -1,9 +1,10 @@
-import { useEffect, useRef, type ReactNode } from "react";
-import { Copy, Loader2 } from "lucide-react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
+import { Copy, Loader2, Plus, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/components/ui/dialog";
 import { useChecker } from "@/state/checker";
 import type { XboxAccountStatus } from "@/hooks/use-xbox-auth";
+import { useXboxAccounts } from "@/hooks/use-xbox-accounts";
 import { cn } from "@/lib/utils";
 
 const STAGE_LABEL: Record<XboxAccountStatus["stage"], string> = {
@@ -57,6 +58,71 @@ export function XboxAccountSummary({ account, className }: { account: XboxAccoun
   );
 }
 
+/**
+ * Every signed-in Xbox account, with the ability to switch which one claims
+ * run as or forget one — the rest are untouched either way.
+ */
+function AccountManager({ onAddAnother }: { onAddAnother: () => void }) {
+  const { accounts, busyId, activate, remove } = useXboxAccounts();
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center justify-between">
+        <p className="eyebrow">Connected accounts</p>
+        <button
+          type="button"
+          onClick={onAddAnother}
+          className="inline-flex items-center gap-1 rounded-md border border-border px-2 py-1 font-mono text-[11px] text-muted-foreground transition-colors hover:text-foreground"
+        >
+          <Plus className="h-3 w-3" />
+          ADD ANOTHER
+        </button>
+      </div>
+      {accounts === null ? (
+        <p className="text-xs text-muted-foreground">Loading…</p>
+      ) : (
+        <ul className="divide-y divide-border/60 rounded-lg border border-border">
+          {accounts.map((a) => (
+            <li key={a.id} className="flex items-center gap-3 px-3.5 py-2.5">
+              <span
+                aria-hidden="true"
+                className={cn("h-2 w-2 shrink-0 rounded-full", a.readiness.ready ? "bg-primary" : "bg-destructive")}
+              />
+              <div className="min-w-0 flex-1">
+                <p className="truncate text-[13px] font-medium">
+                  {a.gamertag ?? a.maskedEmail ?? "Unverified account"}
+                </p>
+                <p className="truncate text-[11px] text-muted-foreground">
+                  {a.maskedEmail ?? "Email not shared"}{a.isActive && " · Active"}
+                </p>
+              </div>
+              {!a.isActive && (
+                <button
+                  type="button"
+                  disabled={busyId === a.id}
+                  onClick={() => void activate(a.id)}
+                  className="shrink-0 rounded-md border border-border px-2 py-1 font-mono text-[11px] text-muted-foreground transition-colors hover:border-primary/40 hover:text-foreground disabled:opacity-40"
+                >
+                  USE
+                </button>
+              )}
+              <button
+                type="button"
+                disabled={busyId === a.id}
+                title="Remove this account"
+                onClick={() => void remove(a.id)}
+                className="shrink-0 rounded-md p-1.5 text-muted-foreground transition-colors hover:text-destructive disabled:opacity-40"
+              >
+                <Trash2 className="h-3.5 w-3.5" />
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
 /** Bottom-left sidebar control. */
 export function ConnectXboxButton({ className }: { className?: string }) {
   const { isAuthed, accountReady, setConnectOpen } = useChecker();
@@ -86,28 +152,47 @@ export function ConnectXboxButton({ className }: { className?: string }) {
 export function ConnectXboxDialog() {
   const { connectOpen, setConnectOpen, auth, isAuthed } = useChecker();
   const { status, loading, startAuth, logout, verify } = auth;
+  const [addingAccount, setAddingAccount] = useState(false);
+  const [acctVersion, setAcctVersion] = useState(0);
   const code = status?.deviceCode ?? null;
   const pending = code?.status === "pending";
   const requested = useRef(false);
+  const showCodeFlow = !isAuthed || addingAccount;
 
-  // Request a code when the dialog opens and there is none pending.
+  // Request a code when the dialog opens (first sign-in), or when the user
+  // asked to add another account, and there is none already pending.
   useEffect(() => {
     if (!connectOpen) { requested.current = false; return; }
-    if (status === null || isAuthed || pending || loading || requested.current) return;
+    if (status === null || !showCodeFlow || pending || loading || requested.current) return;
     requested.current = true;
     void startAuth();
-  }, [connectOpen, status, isAuthed, pending, loading, startAuth]);
+  }, [connectOpen, status, showCodeFlow, pending, loading, startAuth]);
 
-  // Close automatically shortly after sign-in completes AND the account is
-  // verified ready; a not-ready account stays open so the reason is visible.
+  // A device code flow that finishes while adding another account: stop
+  // showing the code screen and refresh the account list, without closing
+  // the whole dialog (the user is looking at their account list, not done).
+  useEffect(() => {
+    if (addingAccount && code?.status === "authorized") {
+      requested.current = false;
+      setAddingAccount(false);
+      setAcctVersion((v) => v + 1);
+      toast.success("Account added");
+    }
+  }, [addingAccount, code?.status]);
+
+  // Close automatically shortly after the FIRST sign-in completes AND the
+  // account is verified ready; a not-ready account stays open so the reason
+  // is visible. Never auto-closes while adding an additional account.
   const ready = status?.account?.ready === true;
   useEffect(() => {
-    if (connectOpen && ready && code?.status === "authorized") {
+    if (connectOpen && ready && code?.status === "authorized" && !addingAccount) {
       const t = setTimeout(() => setConnectOpen(false), 1500);
       return () => clearTimeout(t);
     }
     return undefined;
-  }, [connectOpen, ready, code?.status, setConnectOpen]);
+  }, [connectOpen, ready, code?.status, addingAccount, setConnectOpen]);
+
+  useEffect(() => { if (!connectOpen) setAddingAccount(false); }, [connectOpen]);
 
   const copy = async () => {
     if (!code) return;
@@ -130,7 +215,7 @@ export function ConnectXboxDialog() {
         </div>
 
         <div className="space-y-6 px-6 py-6">
-          {isAuthed ? (
+          {isAuthed && !showCodeFlow ? (
             <div className="space-y-5">
               {status?.account?.checkedAt === null ? (
                 <p className="flex items-center gap-2 text-sm text-muted-foreground" role="status">
@@ -155,8 +240,11 @@ export function ConnectXboxDialog() {
                   onClick={async () => { await logout(); toast.info("Signed out of Xbox"); }}
                   className="rounded-lg border border-border py-2.5 text-sm transition-colors hover:bg-secondary disabled:opacity-50"
                 >
-                  Sign out
+                  Sign out all
                 </button>
+              </div>
+              <div className="border-t border-border pt-5">
+                <AccountManager key={acctVersion} onAddAnother={() => { requested.current = false; setAddingAccount(true); }} />
               </div>
               <p className="text-xs leading-relaxed text-muted-foreground">
                 You signed in on Microsoft&apos;s own page. This app never sees your password; tokens stay on the server.
@@ -164,7 +252,10 @@ export function ConnectXboxDialog() {
             </div>
           ) : (
             <>
-              {status?.account?.code === "invalid_grant" && (
+              {addingAccount && (
+                <p className="text-sm font-medium text-foreground">Adding another Xbox account</p>
+              )}
+              {!addingAccount && status?.account?.code === "invalid_grant" && (
                 <p role="alert" className="rounded-lg border border-destructive/40 bg-destructive/[0.06] px-3.5 py-3 text-[13px]">
                   {status.account.reason}
                 </p>

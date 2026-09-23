@@ -3,6 +3,9 @@ import {
   startDeviceCodeFlow,
   getDeviceCodeState,
   getActiveAccountStatus,
+  getAccountInfoList,
+  setActiveAccount,
+  removeAccount,
   isAuthenticated,
   isXstsReady,
   logoutAllAccounts,
@@ -65,6 +68,28 @@ router.post("/auth/xbox/logout", (req, res): void => {
   logoutAllAccounts();
   req.log.info("Xbox accounts signed out via API");
   res.json({ success: true, authenticated: false });
+});
+
+/**
+ * GET /api/auth/xbox/accounts — every signed-in Xbox account (Account Manager).
+ * Display-safe: masked email/XUID, gamertag, readiness — never a token.
+ */
+router.get("/auth/xbox/accounts", (_req, res): void => {
+  res.json({ accounts: getAccountInfoList() });
+});
+
+/** POST /api/auth/xbox/accounts/:id/activate — switch which account claims run as. */
+router.post("/auth/xbox/accounts/:id/activate", (req, res): void => {
+  const ok = setActiveAccount(req.params.id);
+  if (!ok) { res.status(404).json({ error: "Account not found." }); return; }
+  res.json({ accounts: getAccountInfoList(), account: getActiveAccountStatus() });
+});
+
+/** DELETE /api/auth/xbox/accounts/:id — forget one account (the others are untouched). */
+router.delete("/auth/xbox/accounts/:id", (req, res): void => {
+  const ok = removeAccount(req.params.id);
+  if (!ok) { res.status(404).json({ error: "Account not found." }); return; }
+  res.json({ accounts: getAccountInfoList(), account: getActiveAccountStatus() });
 });
 
 export default router;
