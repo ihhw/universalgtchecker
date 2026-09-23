@@ -8,7 +8,7 @@
  *        { classicGamertag, reservationId: <xuid>, targetGamertagFields: "classicGamertag" }
  *      Reserves the exact name for this account. 409 = taken/reserved elsewhere.
  *      CONFIRMED against live Xbox: this call succeeds (accepts the reservation).
- *   2. PUT accounts.xboxlive.com/users/current/profile/gamertag
+ *   2. POST accounts.xboxlive.com/users/current/profile/gamertag
  *        { gamertag, previewOnly: false }, x-xbl-contract-version: 3
  *      Performs the change using that reservation.
  *
@@ -20,11 +20,15 @@
  *
  * NOTE: these are the endpoints Xbox's own apps use for gamertag changes, per
  * reverse-engineered Xbox Live traffic; they are not officially documented by
- * Microsoft and may change. An earlier version of this file guessed a change
- * URL under gamertag.xboxlive.com that returned HTTP 404 against live Xbox —
- * see .agents/memory/gamertag-autoclaim.md for that history. The endpoint
- * above has NOT yet been confirmed against live Xbox either; the next real
- * claim attempt is the actual test.
+ * Microsoft and may change. Endpoints already ruled out by real testing (see
+ * .agents/memory/gamertag-autoclaim.md for the full history and exact error
+ * bodies):
+ *   - PUT gamertag.xboxlive.com/users/xuid(<xuid>)/gamertag        → HTTP 404
+ *   - PUT accounts.xboxlive.com/users/current/profile/gamertag     → HTTP 405
+ * The POST variant above has NOT yet been confirmed against live Xbox; the
+ * next real claim attempt is the actual test. A 405 response now also
+ * surfaces Xbox's Allow header, so if this is wrong too we get the exact
+ * accepted method(s) without another guess-and-check round.
  */
 
 import { logger } from "./logger";
@@ -341,7 +345,7 @@ export async function claimGamertag(
       change = await send(CHANGE_URL, ctx.authHeader, {
         gamertag,
         previewOnly: false,
-      }, CHANGE_TIMEOUT_MS, { method: "PUT", contractVersion: "3" });
+      }, CHANGE_TIMEOUT_MS, { method: "POST", contractVersion: "3" });
     } catch (err) {
       record.latency.changeMs = ms(tChange);
       // The request may or may not have been applied; ask Xbox.
@@ -424,6 +428,16 @@ export async function claimGamertag(
       return finish("claim_failed", {
         ...cbase, errorCode: "not_found",
         reason: `Xbox returned HTTP 404 for the change request${cDesc ? `: ${cDesc}` : ""}.`,
+      });
+    }
+    if (cs === 405) {
+      // The URL exists but this HTTP method is wrong. Xbox is required to name
+      // the methods it does accept in the Allow header — surface it verbatim
+      // so the next guess doesn't have to be blind.
+      const allow = change.headers.get("allow");
+      return finish("unknown", {
+        ...cbase, errorCode: "xbox_error",
+        reason: `Xbox rejected the HTTP method for the change request (405)${allow ? ` — it accepts: ${allow}` : " (no Allow header returned)"}. Not confirmed; nothing was changed.`,
       });
     }
     // 5xx or anything else: the change may have been applied. Ask Xbox.

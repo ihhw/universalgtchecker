@@ -35,7 +35,7 @@ test("200: reserve + change, Xbox names the exact tag → CLAIMED (change_respon
   assert.match(String(res!.auth), /^XBL3\.0 x=uhs-1;xsts\|http:\/\/xboxlive\.com\|/, "claim uses the xboxlive.com XSTS token");
   assert.deepEqual(res!.body, { classicGamertag: "NewTag", reservationId: "2533274900000001", targetGamertagFields: "classicGamertag" });
   const [chg] = calls("change");
-  assert.equal(chg!.method, "PUT");
+  assert.equal(chg!.method, "POST");
   assert.equal(chg!.path, "/accounts.xboxlive.com/users/current/profile/gamertag");
   assert.deepEqual(chg!.body, { gamertag: "NewTag", previewOnly: false });
   assert.ok(r.latency.totalMs !== null && r.latency.reserveMs !== null && r.latency.changeMs !== null);
@@ -158,6 +158,18 @@ test("5xx at change but Xbox DID apply it → CLAIMED via identity (never lost)"
   const r = await p;
   assert.equal(r.state, "claimed");
   assert.equal(r.confirmedBy, "xsts_identity");
+});
+
+test("405 at change (wrong HTTP method) → UNKNOWN, never CLAIMED, Allow header surfaced verbatim", async () => {
+  await control(mock.url, {
+    queues: { change: [{ status: 405, body: { message: "Method Not Allowed" }, headers: { Allow: "PUT, PATCH" } }] },
+  });
+  const r = await claim.claimGamertag("MethodTag", { source: "manual" });
+  assert.equal(r.state, "unknown");
+  assert.equal(r.httpStatus, 405);
+  assert.match(r.reason ?? "", /405/);
+  assert.match(r.reason ?? "", /it accepts: PUT, PATCH/);
+  assert.notEqual(mock.state.gamertag, "MethodTag", "nothing was actually changed");
 });
 
 test("timeout at reserve → NETWORK ERROR; timeout at change → UNKNOWN", async () => {
