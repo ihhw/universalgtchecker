@@ -676,12 +676,12 @@ async function autoClaimHit(session: Session, gamertag: string): Promise<void> {
 }
 
 router.post("/gamertag/claim", async (req, res): Promise<void> => {
-  const { gamertag } = (req.body ?? {}) as { gamertag?: string };
+  const { gamertag, accountId } = (req.body ?? {}) as { gamertag?: string; accountId?: string };
   if (!gamertag) {
     res.status(400).json({ success: false, error: "gamertag is required", message: "gamertag is required" });
     return;
   }
-  const r = await claimGamertag(gamertag, { source: "manual" });
+  const r = await claimGamertag(gamertag, { source: "manual", accountId: typeof accountId === "string" ? accountId : undefined });
   const status = r.errorCode === "invalid_gamertag" ? 400 : CLAIM_HTTP[r.state];
   res.status(status).json(claimResponse(r));
 });

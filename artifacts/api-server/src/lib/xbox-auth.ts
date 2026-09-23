@@ -27,6 +27,7 @@ import fs from "fs";
 import path from "path";
 import crypto from "crypto";
 import { xboxUrl } from "./xbox-http";
+import { logAudit } from "./audit";
 
 // App registration "GT hinter". The client ID is a public identifier (not a
 // secret) and is kept on the server. Override with XBOX_CLIENT_ID.
@@ -312,6 +313,7 @@ async function refreshMsToken(account: AccountState): Promise<string | null> {
           account.xblToken = null;
           persistAccounts();
           setReadiness(account, "microsoft", "Microsoft sign-in expired or was revoked. Connect Xbox again.", errCode);
+          logAudit("ACCOUNT_REFRESH_FAILED", { accountId: account.id, errorCode: errCode });
         } else {
           logger.warn({ accountId: account.id, status: res.status, error: errCode }, "MS token refresh rejected — retaining for retry");
           setReadiness(account, "microsoft", `Microsoft rejected the token refresh (HTTP ${res.status}${errCode ? `, ${errCode}` : ""}).`, errCode || null);
@@ -440,7 +442,9 @@ async function _doFetchXsts(account: AccountState, allowCachedXbl = true): Promi
     if (!account.xuid) {
       setReadiness(account, "xuid", "Xbox did not return an XUID for this account, so it cannot claim gamertags.");
     } else {
+      const wasReady = account.readiness.stage === "ready";
       setReadiness(account, "ready", null);
+      if (!wasReady) logAudit("ACCOUNT_CONNECTED", { accountId: account.id, xuid: account.xuid });
     }
 
     logger.info({ accountId: account.id, expiresAt: xstsData.NotAfter }, "✅ XSTS token obtained — ready for Xbox API calls");
@@ -527,6 +531,7 @@ async function pollLoop(): Promise<void> {
       if (data.error) {
         logger.warn({ error: data.error }, "Device code flow error");
         if (dcState) { dcState.status = "error"; dcState.error = data.error; }
+        logAudit("ACCOUNT_AUTH_FAILED", { errorCode: data.error });
         return;
       }
 
@@ -547,6 +552,7 @@ async function pollLoop(): Promise<void> {
 
         if (dcState) dcState.status = "authorized";
         logger.info({ accountId: id }, "✅ New Xbox account added");
+        logAudit("ACCOUNT_AUTH_SUCCESS", { accountId: id });
 
         // Resolve Xbox Live → XSTS → XUID right away so readiness is known.
         fetchXstsForAccount(id).catch(() => {});
@@ -597,6 +603,7 @@ export async function startDeviceCodeFlow(): Promise<DeviceCodeInfo> {
   };
 
   logger.info({ verificationUri: dcState.verificationUri }, "Device code flow started");
+  logAudit("ACCOUNT_AUTH_STARTED", {});
   pollLoop().catch((err) => logger.error({ err }, "Poll loop error"));
   return dcState;
 }
@@ -626,6 +633,7 @@ export function removeAccount(id: string): boolean {
   }
   persistAccounts();
   logger.info({ accountId: id }, "Xbox account removed");
+  logAudit("ACCOUNT_DISCONNECTED", { accountId: id });
   return true;
 }
 
@@ -644,6 +652,7 @@ export function getActiveAccountId(): string | null { return activeAccountId; }
  * .xbox-auth.json with an empty v2 record so they don't reload on restart.
  */
 export function logoutAllAccounts(): void {
+  const ids = [...accounts.keys()];
   accounts.clear();
   activeAccountId = null;
   try {
@@ -651,6 +660,7 @@ export function logoutAllAccounts(): void {
     fs.writeFileSync(AUTH_FILE, JSON.stringify(empty, null, 2), { encoding: "utf8", mode: 0o600 });
   } catch { /* non-critical */ }
   logger.info("All Xbox accounts signed out");
+  for (const id of ids) logAudit("ACCOUNT_DISCONNECTED", { accountId: id });
 }
 
 /** Auth header for availability checks — uses the active account (or first available). */
@@ -662,18 +672,19 @@ export async function getAuthHeader(): Promise<string | null> {
   return `XBL3.0 x=${xsts.uhs};${xsts.token}`;
 }
 
-/** Everything a claim needs, for the active account — or the exact reason it isn't available. */
+/** Everything a claim needs, for the given account (default: the active one) — or the exact reason it isn't available. */
 export type ClaimContext =
   | { ok: true; accountId: string; authHeader: string; xuid: string; gamertag: string | null }
   | { ok: false; stage: AuthStage; reason: string; code: string | null };
 
-export async function getClaimContext(): Promise<ClaimContext> {
-  if (!activeAccountId) {
+export async function getClaimContext(accountId?: string): Promise<ClaimContext> {
+  const id = accountId ?? activeAccountId;
+  if (!id) {
     return { ok: false, stage: "none", reason: "No Xbox account connected. Connect Xbox first.", code: null };
   }
-  const account = accounts.get(activeAccountId);
+  const account = accounts.get(id);
   if (!account) return { ok: false, stage: "none", reason: "No Xbox account connected. Connect Xbox first.", code: null };
-  const xsts = await fetchXstsForAccount(activeAccountId);
+  const xsts = await fetchXstsForAccount(id);
   if (!xsts) {
     return {
       ok: false,
@@ -695,15 +706,17 @@ export async function getClaimContext(): Promise<ClaimContext> {
 }
 
 /**
- * Re-issues the active account's XSTS token (reusing the cached Xbox Live user
- * token when possible) and returns the gamertag Xbox now reports for it.
- * Used to independently confirm a claim; also used by "Verify" in the UI.
+ * Re-issues the given account's XSTS token (default: the active one; reuses
+ * the cached Xbox Live user token when possible) and returns the gamertag
+ * Xbox now reports for it. Used to independently confirm a claim; also used
+ * by "Verify" in the UI.
  */
-export async function refreshActiveIdentity(): Promise<{ ok: boolean; gamertag: string | null; xuid: string | null }> {
-  if (!activeAccountId) return { ok: false, gamertag: null, xuid: null };
-  const account = accounts.get(activeAccountId);
+export async function refreshActiveIdentity(accountId?: string): Promise<{ ok: boolean; gamertag: string | null; xuid: string | null }> {
+  const id = accountId ?? activeAccountId;
+  if (!id) return { ok: false, gamertag: null, xuid: null };
+  const account = accounts.get(id);
   if (!account) return { ok: false, gamertag: null, xuid: null };
-  const r = await fetchXstsForAccount(activeAccountId, true);
+  const r = await fetchXstsForAccount(id, true);
   return { ok: r !== null, gamertag: account.gamertag, xuid: account.xuid };
 }
 

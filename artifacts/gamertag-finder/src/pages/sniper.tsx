@@ -5,6 +5,7 @@ import { Switch } from "@/components/ui/switch";
 import { Panel, Eyebrow, PageHeader } from "@/components/panel";
 import { XboxAccountSummary } from "@/components/xbox-connect";
 import { useChecker } from "@/state/checker";
+import { useXboxAccounts } from "@/hooks/use-xbox-accounts";
 import {
   useSniperTargets,
   type SniperAvailability, type SniperClaim, type SniperConfig, type SniperEvent, type SniperSnapshot, type SniperState,
@@ -66,7 +67,7 @@ function fmtMs(v: number | null | undefined): string {
 }
 
 function readDraft(): SniperConfig {
-  const base: SniperConfig = { target: "", intervalMs: 1_500, autoClaim: true, notifications: true, doubleCheck: true };
+  const base: SniperConfig = { target: "", intervalMs: 1_500, autoClaim: true, notifications: true, doubleCheck: true, accountId: undefined };
   try {
     const raw = readStored(DRAFT_KEY);
     const d = raw ? (JSON.parse(raw) as Partial<SniperConfig>) : {};
@@ -76,6 +77,7 @@ function readDraft(): SniperConfig {
       autoClaim: typeof d.autoClaim === "boolean" ? d.autoClaim : base.autoClaim,
       notifications: typeof d.notifications === "boolean" ? d.notifications : base.notifications,
       doubleCheck: typeof d.doubleCheck === "boolean" ? d.doubleCheck : base.doubleCheck,
+      accountId: typeof d.accountId === "string" ? d.accountId : undefined,
     };
   } catch {
     return base;
@@ -335,6 +337,7 @@ function TargetCard({
 export default function SniperPage() {
   const c = useChecker();
   const { targets, eventsById, limits, streamConnected, reachable, startTarget, stopTarget, removeTarget, updateTargetSettings } = useSniperTargets();
+  const { accounts } = useXboxAccounts();
   const [draft, setDraft] = useState<SniperConfig>(readDraft);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [starting, setStarting] = useState(false);
@@ -467,6 +470,27 @@ export default function SniperPage() {
               checked={draft.autoClaim}
               onChange={(v) => setField("autoClaim", v)}
             />
+            {draft.autoClaim && (
+              <div className="py-3.5">
+                <label htmlFor="sniper-account" className="text-sm font-medium">Claim account</label>
+                <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+                  Automatic picks any connected account that's ready and not already claiming.
+                </p>
+                <select
+                  id="sniper-account"
+                  value={draft.accountId ?? "automatic"}
+                  onChange={(e) => setField("accountId", e.target.value === "automatic" ? undefined : e.target.value)}
+                  className="mt-2 w-full rounded-lg border border-input bg-[hsl(var(--well))] px-3 py-2 text-sm"
+                >
+                  <option value="automatic">Automatic</option>
+                  {accounts?.map((a) => (
+                    <option key={a.id} value={a.id}>
+                      {a.gamertag ?? a.maskedEmail ?? a.id} {a.readiness.ready ? "" : "(not ready)"}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
             <Toggle
               id="sniper-doublecheck"
               title="Double Check"

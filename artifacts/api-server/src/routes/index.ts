@@ -9,6 +9,7 @@ import botRouter      from "./bot";
 import sniperRouter   from "./sniper";
 import analyticsRouter from "./analytics";
 import diagnosticsRouter from "./diagnostics";
+import auditRouter from "./audit";
 
 const router: IRouter = Router();
 
@@ -22,5 +23,6 @@ router.use(botRouter);
 router.use(sniperRouter);
 router.use(analyticsRouter);
 router.use(diagnosticsRouter);
+router.use(auditRouter);
 
 export default router;

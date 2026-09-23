@@ -58,6 +58,80 @@ function Bool({ v }: { v: boolean }) {
   return <span className={v ? "text-primary" : "text-muted-foreground"}>{v ? "YES" : "NO"}</span>;
 }
 
+interface AuditEntry {
+  id: number;
+  ts: number;
+  event: string;
+  meta: Record<string, string | number | boolean>;
+}
+
+const AUDIT_TONE: Record<string, "good" | "bad" | "muted"> = {
+  CLAIM_CONFIRMED: "good",
+  ACCOUNT_CONNECTED: "good",
+  ACCOUNT_AUTH_SUCCESS: "good",
+  CLAIM_FAILED: "bad",
+  ACCOUNT_AUTH_FAILED: "bad",
+  ACCOUNT_REFRESH_FAILED: "bad",
+  ACCOUNT_DISCONNECTED: "muted",
+};
+
+function AuditLog() {
+  const [entries, setEntries] = useState<AuditEntry[]>([]);
+  const [reachable, setReachable] = useState(true);
+
+  useEffect(() => {
+    let disposed = false;
+    const load = async () => {
+      try {
+        const res = await fetch(api("/audit"));
+        if (!res.ok) throw new Error(String(res.status));
+        const d = (await res.json()) as { entries: AuditEntry[] };
+        if (!disposed) { setEntries(d.entries); setReachable(true); }
+      } catch {
+        if (!disposed) setReachable(false);
+      }
+    };
+    void load();
+    const t = setInterval(load, 5_000);
+    return () => { disposed = true; clearInterval(t); };
+  }, []);
+
+  const rows = [...entries].reverse().slice(0, 100);
+
+  return (
+    <Panel className="lg:col-span-2 p-0">
+      <div className="flex items-center justify-between border-b border-border px-5 py-3.5">
+        <Eyebrow>Audit log</Eyebrow>
+        {!reachable && <span className="text-xs text-destructive">Unreachable</span>}
+      </div>
+      {rows.length === 0 ? (
+        <p className="px-5 py-8 text-center text-sm text-muted-foreground">No audit events yet.</p>
+      ) : (
+        <ul className="max-h-[400px] divide-y divide-border/60 overflow-y-auto">
+          {rows.map((e) => {
+            const tone = AUDIT_TONE[e.event] ?? "muted";
+            const metaText = Object.entries(e.meta).map(([k, v]) => `${k}=${v}`).join(" · ");
+            return (
+              <li key={e.id} className="flex flex-wrap items-baseline gap-x-3 gap-y-1 px-5 py-2.5 font-mono text-[12px]">
+                <span className="text-muted-foreground/60">{new Date(e.ts).toLocaleTimeString()}</span>
+                <span className={cn(
+                  "font-semibold tracking-wide",
+                  tone === "good" && "text-primary",
+                  tone === "bad" && "text-destructive",
+                  tone === "muted" && "text-foreground",
+                )}>
+                  {e.event}
+                </span>
+                {metaText && <span className="text-muted-foreground">{metaText}</span>}
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </Panel>
+  );
+}
+
 export default function DiagnosticsPage() {
   const [data, setData] = useState<Diagnostics | null>(null);
   const [reachable, setReachable] = useState(true);
@@ -180,6 +254,8 @@ export default function DiagnosticsPage() {
               ))}
             </div>
           </Panel>
+
+          <AuditLog />
         </div>
       )}
     </>

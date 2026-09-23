@@ -36,6 +36,7 @@ router.post("/xbox/sniper/targets", async (req, res): Promise<void> => {
     autoClaim: body.autoClaim,
     notifications: body.notifications,
     doubleCheck: body.doubleCheck,
+    accountId: body.accountId,
   });
   if (!r.ok) { res.status(r.status).json({ error: r.error }); return; }
   res.status(201).json(getSniperSnapshot(r.id));

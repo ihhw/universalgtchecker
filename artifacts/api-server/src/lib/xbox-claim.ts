@@ -43,10 +43,11 @@
 
 import { logger } from "./logger";
 import { validateXboxGamertag } from "./xbox-validation";
-import { getClaimContext, refreshActiveIdentity } from "./xbox-auth";
+import { getClaimContext, refreshActiveIdentity, getActiveAccountId, getAccountInfoList } from "./xbox-auth";
 import { fastFetch, retryAfterMs, warmConnection } from "./xbox-http";
 import { getWebhookTarget, sendWebhookPayload } from "./webhook-store";
 import { recordClaim } from "./stats";
+import { logAudit } from "./audit";
 
 const GAMERTAG_HOST = "https://gamertag.xboxlive.com";
 const RESERVE_URL   = `${GAMERTAG_HOST}/gamertags/reserve`;
@@ -94,6 +95,8 @@ export interface ClaimRecord {
   gamertag:    string;
   source:      ClaimSource;
   sessionId?:  string;
+  /** Which Xbox account performed this claim (internal id, never a token). */
+  accountId:   string | null;
   state:       ClaimState;
   errorCode:   ClaimErrorCode | null;
   /** Human-readable explanation, including what Xbox said. */
@@ -142,10 +145,68 @@ export function listClaims(afterId = 0): ClaimRecord[] {
   return records.filter((r) => r.id > afterId || r.finishedAt === null);
 }
 
-// Only one claim may run at a time: a successful claim renames the account,
-// so two concurrent claims could rename it twice.
-let busy: string | null = null;
-export function claimInProgress(): string | null { return busy; }
+// Only one claim may run at a time PER ACCOUNT: a successful claim renames
+// that account, so two concurrent claims on the same account could rename it
+// twice. Different accounts may claim concurrently — each has its own entry.
+const busy = new Map<string, string>();
+export function claimInProgress(accountId: string): string | null { return busy.get(accountId) ?? null; }
+
+export type AccountSelection = "automatic" | string;
+
+/**
+ * Resolves which Xbox account a claim should run as.
+ *   - A specific account id: must exist, be READY, and not already claiming.
+ *   - "automatic" / undefined: any READY, non-busy account, preferring the
+ *     currently active one so single-account setups behave exactly as before.
+ * Never silently substitutes a different account for an explicit request,
+ * and never picks an account that isn't READY — a claim on a not-ready or
+ * already-busy account is a recorded failure, not a silent reassignment.
+ */
+export type AccountSelectionFailure = { ok: false; kind: "no_account" | "busy"; reason: string };
+
+export function selectAccountForClaim(requested?: AccountSelection): { ok: true; accountId: string } | AccountSelectionFailure {
+  const accounts = getAccountInfoList();
+  if (accounts.length === 0) return { ok: false, kind: "no_account", reason: "No Xbox account connected. Connect Xbox first." };
+
+  if (requested && requested !== "automatic") {
+    const acct = accounts.find((a) => a.id === requested);
+    if (!acct) return { ok: false, kind: "no_account", reason: "Selected Xbox account was not found." };
+    if (busy.has(acct.id)) {
+      return {
+        ok: false, kind: "busy",
+        reason: `A claim for "${busy.get(acct.id)}" is already in progress on this account. Only one claim per account runs at a time.`,
+      };
+    }
+    // Readiness isn't re-checked here: the cached flag can be stale (e.g.
+    // right after a restart, before the first live check), and
+    // getClaimContext() immediately after this always re-verifies live and
+    // fails closed if the account genuinely isn't usable.
+    return { ok: true, accountId: acct.id };
+  }
+
+  // Automatic: never pick a busy account. Prefer one already confirmed
+  // READY; fall back to an unverified one only when none is — the live
+  // check right after this is still the real, fail-closed source of truth.
+  const free = accounts.filter((a) => !busy.has(a.id));
+  if (free.length === 0) {
+    const anyBusyGamertag = [...busy.values()][0];
+    return {
+      ok: false, kind: "busy",
+      reason: `A claim for "${anyBusyGamertag}" is already in progress. Only one claim runs at a time per account, and every connected account is currently claiming.`,
+    };
+  }
+  // Prefer the active account whenever it's free, exactly like the
+  // single-account app always behaved — even if it hasn't been live-checked
+  // yet (getClaimContext still verifies it for real right after this).
+  // Only fall back to a different account when the active one is busy or
+  // gone, and among fallbacks prefer one already confirmed READY.
+  const activeId = getActiveAccountId();
+  const activeCandidate = free.find((a) => a.id === activeId);
+  if (activeCandidate) return { ok: true, accountId: activeCandidate.id };
+  const ready = free.filter((a) => a.readiness.ready);
+  const chosen = ready[0] ?? free[0]!;
+  return { ok: true, accountId: chosen.id };
+}
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -234,12 +295,12 @@ async function send(
 
 export async function claimGamertag(
   rawGamertag: string,
-  opts: { source: ClaimSource; sessionId?: string },
+  opts: { source: ClaimSource; sessionId?: string; accountId?: AccountSelection },
 ): Promise<ClaimRecord> {
   const t0 = now();
   const gamertag = String(rawGamertag ?? "").trim();
   const record: ClaimRecord = {
-    id: nextId++, gamertag, source: opts.source, sessionId: opts.sessionId,
+    id: nextId++, gamertag, source: opts.source, sessionId: opts.sessionId, accountId: null,
     state: "claiming", errorCode: null, reason: null, step: null, httpStatus: null,
     xboxResponse: null, assignedGamertag: null, confirmedBy: null,
     startedAt: Date.now(), finishedAt: null,
@@ -258,9 +319,14 @@ export async function claimGamertag(
       "Gamertag claim finished",
     );
     publish(record);
+    if (state === "claimed") {
+      logAudit("CLAIM_CONFIRMED", { gamertag, accountId: record.accountId ?? "", source: record.source });
+    } else {
+      logAudit("CLAIM_FAILED", { gamertag, accountId: record.accountId ?? "", source: record.source, errorCode: record.errorCode ?? "" });
+    }
     // Xbox confirmed the change in its response; refresh the cached identity
     // in the background so the UI shows the account's new gamertag.
-    if (state === "claimed" && record.confirmedBy === "change_response") void refreshActiveIdentity().catch(() => undefined);
+    if (state === "claimed" && record.confirmedBy === "change_response") void refreshActiveIdentity(record.accountId ?? undefined).catch(() => undefined);
     return record;
   };
 
@@ -268,13 +334,19 @@ export async function claimGamertag(
   if (!validation.valid) {
     return finish("claim_failed", { errorCode: "invalid_gamertag", step: "validate", reason: validation.errors.join(" ") });
   }
-  if (busy) {
-    return finish("claim_failed", {
-      errorCode: "claim_in_progress", step: "validate",
-      reason: `A claim for "${busy}" is already in progress. Only one claim runs at a time.`,
-    });
+
+  const selection = selectAccountForClaim(opts.accountId);
+  if (!selection.ok) {
+    if (selection.kind === "busy") {
+      return finish("claim_failed", { errorCode: "claim_in_progress", step: "validate", reason: selection.reason });
+    }
+    return finish("auth_error", { errorCode: "auth_required", step: "auth", reason: selection.reason });
   }
-  busy = gamertag;
+  const accountId = selection.accountId;
+  record.accountId = accountId;
+  busy.set(accountId, gamertag);
+  logAudit("ACCOUNT_SELECTED_FOR_CLAIM", { accountId, gamertag, source: record.source });
+  logAudit("CLAIM_STARTED", { gamertag, accountId, source: record.source });
 
   records.push(record);
   if (records.length > MAX_RECORDS) records.splice(0, records.length - MAX_RECORDS);
@@ -283,7 +355,7 @@ export async function claimGamertag(
   try {
     // ── Auth context: XSTS (http://xboxlive.com) + XUID ────────────────────
     const tAuth = now();
-    let ctx = await getClaimContext();
+    let ctx = await getClaimContext(accountId);
     record.latency.authMs = ms(tAuth);
     if (!ctx.ok) {
       return finish("auth_error", { errorCode: "auth_required", step: "auth", reason: ctx.reason });
@@ -301,8 +373,8 @@ export async function claimGamertag(
       reserve = await send(RESERVE_URL, ctx.authHeader, reserveBody(), RESERVE_TIMEOUT_MS);
       if (reserve.status === 401) {
         // The cached XSTS token was rejected; re-issue it once and retry.
-        await refreshActiveIdentity();
-        ctx = await getClaimContext();
+        await refreshActiveIdentity(accountId);
+        ctx = await getClaimContext(accountId);
         if (!ctx.ok) {
           record.latency.reserveMs = ms(tReserve);
           return finish("auth_error", { errorCode: "auth_failed", step: "reserve", httpStatus: 401, reason: ctx.reason });
@@ -404,7 +476,7 @@ export async function claimGamertag(
       record.latency.changeMs = ms(tChange);
       // The request may or may not have been applied; ask Xbox.
       const kind = errorKind(err);
-      const confirmed = await confirmViaIdentity(record, gamertag);
+      const confirmed = await confirmViaIdentity(record, gamertag, accountId);
       if (confirmed) return finish("claimed", { step: "confirm", errorCode: null, reason: null, confirmedBy: "xsts_identity" });
       return finish(kind === "timeout" ? "unknown" : "network_error", {
         step: "change", errorCode: kind === "timeout" ? "timeout" : "network_error",
@@ -436,7 +508,7 @@ export async function claimGamertag(
         return finish("claimed", { ...cbase, assignedGamertag: assigned, confirmedBy: "change_response", errorCode: null, reason: null });
       }
       // Accepted, but the body doesn't prove the exact name: confirm independently.
-      const confirmed = await confirmViaIdentity(record, gamertag);
+      const confirmed = await confirmViaIdentity(record, gamertag, accountId);
       if (confirmed) {
         return finish("claimed", { ...cbase, step: "confirm", confirmedBy: "xsts_identity", errorCode: null, reason: null });
       }
@@ -504,7 +576,7 @@ export async function claimGamertag(
       });
     }
     // 5xx or anything else: the change may have been applied. Ask Xbox.
-    const confirmed = await confirmViaIdentity(record, gamertag);
+    const confirmed = await confirmViaIdentity(record, gamertag, accountId);
     if (confirmed) return finish("claimed", { ...cbase, step: "confirm", confirmedBy: "xsts_identity", errorCode: null, reason: null });
     if (cs >= 500) {
       return finish("claim_failed", {
@@ -520,7 +592,7 @@ export async function claimGamertag(
     logger.warn({ gamertag, errName: err instanceof Error ? err.name : "unknown" }, "Claim failed unexpectedly");
     return finish("unknown", { errorCode: "xbox_error", reason: "Unexpected error during the claim; not confirmed." });
   } finally {
-    busy = null;
+    busy.delete(accountId);
   }
 }
 
@@ -535,11 +607,11 @@ export async function claimGamertag(
 // after one instant check.
 const CONFIRM_RETRY_DELAYS_MS = [1_500, 2_000, 2_500];
 
-async function confirmViaIdentity(record: ClaimRecord, gamertag: string): Promise<boolean> {
+async function confirmViaIdentity(record: ClaimRecord, gamertag: string, accountId: string): Promise<boolean> {
   const t = now();
   try {
     for (let attempt = 0; ; attempt++) {
-      const id = await refreshActiveIdentity();
+      const id = await refreshActiveIdentity(accountId);
       record.assignedGamertag = id.gamertag;
       if (id.ok && sameTag(id.gamertag, gamertag)) return true;
       const delay = CONFIRM_RETRY_DELAYS_MS[attempt];

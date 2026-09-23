@@ -15,6 +15,8 @@ export interface SniperConfig {
   autoClaim: boolean;
   notifications: boolean;
   doubleCheck: boolean;
+  /** Which Xbox account claims for this target; undefined/"automatic" picks any READY, non-busy account. */
+  accountId?: string;
 }
 
 export interface SniperEvent {

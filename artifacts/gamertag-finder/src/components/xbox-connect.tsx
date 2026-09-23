@@ -1,11 +1,22 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
-import { Copy, Loader2, Plus, Trash2 } from "lucide-react";
+import { Copy, ExternalLink, Loader2, Plus, RefreshCw, Trash2, UserPlus } from "lucide-react";
 import { toast } from "sonner";
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/components/ui/dialog";
 import { useChecker } from "@/state/checker";
 import type { XboxAccountStatus } from "@/hooks/use-xbox-auth";
 import { useXboxAccounts } from "@/hooks/use-xbox-accounts";
+import { api } from "@/lib/api";
+import { generateStrongPassword, suggestEmailLocalPart } from "@/lib/generate-credentials";
 import { cn } from "@/lib/utils";
+
+/** Best-effort audit note for the 3 steps of account creation the server can't observe directly (the user filling out Microsoft's own form). Never blocks the UI if it fails. */
+function logClientAudit(event: "ACCOUNT_CREATION_STARTED" | "ACCOUNT_CREATION_AWAITING_USER" | "ACCOUNT_CREATION_CONFIRMED") {
+  void fetch(api("/audit/client"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ event }),
+  }).catch(() => { /* non-critical */ });
+}
 
 const STAGE_LABEL: Record<XboxAccountStatus["stage"], string> = {
   none: "Not verified",
@@ -54,6 +65,144 @@ export function XboxAccountSummary({ account, className }: { account: XboxAccoun
           {account.code && <span className="ml-1 font-mono text-xs text-muted-foreground">({account.code})</span>}
         </div>
       )}
+    </div>
+  );
+}
+
+async function copyText(text: string, label: string) {
+  try {
+    await navigator.clipboard.writeText(text);
+    toast.success(`${label} copied`);
+  } catch {
+    toast.error(`Could not copy the ${label.toLowerCase()}. Select it manually.`);
+  }
+}
+
+const MICROSOFT_SIGNUP_URL = "https://signup.live.com/signup";
+
+/**
+ * Assisted Microsoft account creation. This only ever: suggests an email
+ * local-part and a strong password, opens Microsoft's own signup page in a
+ * new tab, and — once the user confirms they finished it there — starts the
+ * exact same device-code sign-in the app already uses for "Connect Xbox".
+ * It never touches CAPTCHA, phone/email verification, or any of Microsoft's
+ * anti-abuse checks; those stay entirely on Microsoft's page, for the user
+ * to complete themselves.
+ */
+function AccountCreator({ onConnectNew }: { onConnectNew: () => void }) {
+  const [open, setOpen] = useState(false);
+  const [email, setEmail] = useState(() => suggestEmailLocalPart());
+  const [password, setPassword] = useState(() => generateStrongPassword());
+  const [signupOpened, setSignupOpened] = useState(false);
+
+  const regenerate = () => {
+    setEmail(suggestEmailLocalPart());
+    setPassword(generateStrongPassword());
+    setSignupOpened(false);
+  };
+
+  const start = () => {
+    setOpen(true);
+    setSignupOpened(false);
+    logClientAudit("ACCOUNT_CREATION_STARTED");
+  };
+
+  const openSignup = () => {
+    window.open(MICROSOFT_SIGNUP_URL, "_blank", "noopener,noreferrer");
+    setSignupOpened(true);
+    logClientAudit("ACCOUNT_CREATION_AWAITING_USER");
+  };
+
+  const confirmAndConnect = () => {
+    logClientAudit("ACCOUNT_CREATION_CONFIRMED");
+    setOpen(false);
+    onConnectNew();
+  };
+
+  if (!open) {
+    return (
+      <button
+        type="button"
+        onClick={start}
+        className="inline-flex w-full items-center justify-center gap-2 rounded-lg border border-dashed border-border py-2.5 text-sm text-muted-foreground transition-colors hover:border-primary/40 hover:text-foreground"
+      >
+        <UserPlus className="h-4 w-4" />
+        Create Microsoft account
+      </button>
+    );
+  }
+
+  return (
+    <div className="space-y-4 rounded-lg border border-border p-4">
+      <div className="flex items-center justify-between">
+        <p className="eyebrow">Account creator</p>
+        <button type="button" onClick={regenerate} className="inline-flex items-center gap-1 text-[11px] text-muted-foreground transition-colors hover:text-foreground">
+          <RefreshCw className="h-3 w-3" />
+          Regenerate
+        </button>
+      </div>
+
+      <p className="text-[13px] leading-relaxed text-muted-foreground">
+        Suggested details for a new Microsoft account. You'll pick the domain (outlook.com, etc.) and complete
+        any verification Microsoft asks for — CAPTCHA, phone or email — yourself, on Microsoft's own page.
+      </p>
+
+      <div className="space-y-2.5">
+        <div>
+          <label className="eyebrow mb-1 block">Suggested email (local part)</label>
+          <div className="flex items-center gap-2">
+            <input
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              spellCheck={false}
+              className="w-full rounded-lg border border-input bg-[hsl(var(--well))] px-3 py-2 font-mono text-sm"
+            />
+            <button type="button" onClick={() => void copyText(email, "Email")} className="shrink-0 rounded-lg p-2 text-muted-foreground hover:bg-secondary hover:text-foreground">
+              <Copy className="h-4 w-4" />
+            </button>
+          </div>
+        </div>
+        <div>
+          <label className="eyebrow mb-1 block">Suggested password</label>
+          <div className="flex items-center gap-2">
+            <input
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              spellCheck={false}
+              className="w-full rounded-lg border border-input bg-[hsl(var(--well))] px-3 py-2 font-mono text-sm"
+            />
+            <button type="button" onClick={() => void copyText(password, "Password")} className="shrink-0 rounded-lg p-2 text-muted-foreground hover:bg-secondary hover:text-foreground">
+              <Copy className="h-4 w-4" />
+            </button>
+          </div>
+        </div>
+        <p className="text-xs text-muted-foreground">Save these somewhere safe — this app does not store them.</p>
+      </div>
+
+      <div className="space-y-2.5 border-t border-border pt-4">
+        <button
+          type="button"
+          onClick={openSignup}
+          className="inline-flex w-full items-center justify-center gap-2 rounded-lg bg-primary py-2.5 text-sm font-semibold text-primary-foreground transition-opacity hover:opacity-90"
+        >
+          <ExternalLink className="h-4 w-4" />
+          Open Microsoft signup page
+        </button>
+        <p className="text-xs text-muted-foreground">
+          Complete sign-up there, including any verification Microsoft requires. Come back here when done.
+        </p>
+        <button
+          type="button"
+          disabled={!signupOpened}
+          onClick={confirmAndConnect}
+          className="w-full rounded-lg border border-primary/50 py-2.5 text-sm font-medium text-primary transition-colors hover:bg-primary/10 disabled:cursor-not-allowed disabled:opacity-40"
+        >
+          I've created the account — connect it
+        </button>
+        <button type="button" onClick={() => setOpen(false)} className="w-full text-center text-xs text-muted-foreground hover:text-foreground">
+          Cancel
+        </button>
+      </div>
     </div>
   );
 }
@@ -243,8 +392,9 @@ export function ConnectXboxDialog() {
                   Sign out all
                 </button>
               </div>
-              <div className="border-t border-border pt-5">
+              <div className="space-y-4 border-t border-border pt-5">
                 <AccountManager key={acctVersion} onAddAnother={() => { requested.current = false; setAddingAccount(true); }} />
+                <AccountCreator onConnectNew={() => { requested.current = false; setAddingAccount(true); }} />
               </div>
               <p className="text-xs leading-relaxed text-muted-foreground">
                 You signed in on Microsoft&apos;s own page. This app never sees your password; tokens stay on the server.

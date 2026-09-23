@@ -50,6 +50,8 @@ export interface SniperConfig {
   autoClaim:     boolean;
   notifications: boolean;
   doubleCheck:   boolean;
+  /** Which Xbox account claims for this target; "automatic" (default) picks any READY, non-busy account. */
+  accountId?:    string;
 }
 
 export type SniperState = "idle" | "watching" | "claiming" | "claimed" | "stopped" | "error";
@@ -308,7 +310,7 @@ async function runClaim(run: TargetRun, runId: string, target: string, checkStar
   run.snap.latency.reactionMs = Math.round(claimStart - detectedAt);
   log(run, "claim", `Claim request sent for ${target}`);
 
-  const r = await claimGamertag(target, { source: "sniper" });
+  const r = await claimGamertag(target, { source: "sniper", accountId: run.snap.config.accountId });
   run.snap.lastClaim = r;
   run.snap.latency.claimMs = r.latency.totalMs;
   run.snap.latency.totalMs = since(checkStart);
@@ -459,6 +461,7 @@ export function validateSniperConfig(input: Partial<SniperConfig>): { ok: true; 
   if (!Number.isFinite(interval) || interval < MIN_INTERVAL_MS || interval > MAX_INTERVAL_MS) {
     return { ok: false, error: `Check interval must be between ${MIN_INTERVAL_MS} ms and ${MAX_INTERVAL_MS / 1000} s.` };
   }
+  const accountId = typeof input.accountId === "string" && input.accountId.trim() !== "" ? input.accountId.trim() : undefined;
   return {
     ok: true,
     config: {
@@ -467,6 +470,7 @@ export function validateSniperConfig(input: Partial<SniperConfig>): { ok: true; 
       autoClaim: input.autoClaim !== false,
       notifications: input.notifications !== false,
       doubleCheck: input.doubleCheck !== false,
+      accountId,
     },
   };
 }
