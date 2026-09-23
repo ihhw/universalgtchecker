@@ -1,19 +1,48 @@
-import { BASE } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
-const LOGO_SRC = `${BASE}/logo-small.png`;
-
-/** The Universal Checker logo (sleeping cat over "UNI"). */
+/**
+ * Universal Checker mark: a unified U + C monogram. Geometric, symbol-only —
+ * no wordmark is baked into the artwork (see `Brand` for the text lockup).
+ * Rendered as inline SVG so it's crisp at any size and themeable via
+ * currentColor-free gradients matched to the white/beige palette.
+ */
 export function LogoMark({ className }: { className?: string }) {
   return (
-    <img
-      src={LOGO_SRC}
-      alt=""
-      width={148}
-      height={96}
-      decoding="async"
-      className={cn("h-9 w-auto shrink-0 select-none", className)}
-    />
+    <svg
+      viewBox="0 0 64 64"
+      role="img"
+      aria-label="Universal Checker"
+      className={cn("h-9 w-9 shrink-0 select-none", className)}
+    >
+      <defs>
+        <linearGradient id="uc-u" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0" stopColor="#3A332B" />
+          <stop offset="1" stopColor="#221E19" />
+        </linearGradient>
+        <linearGradient id="uc-c" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0" stopColor="#AC9880" />
+          <stop offset="1" stopColor="#8C7A63" />
+        </linearGradient>
+      </defs>
+
+      {/* U: two rounded bars joined by a wide rounded turn, dark charcoal. */}
+      <path
+        d="M13 11 L13 35 A11 11 0 0 0 35 35 L35 11"
+        fill="none"
+        stroke="url(#uc-u)"
+        strokeWidth="7.2"
+        strokeLinecap="round"
+      />
+
+      {/* C: a taupe ring open to the right, its arc passing through the U's right leg. */}
+      <path
+        d="M51 21.5 A15 15 0 1 0 51 42.5"
+        fill="none"
+        stroke="url(#uc-c)"
+        strokeWidth="7.2"
+        strokeLinecap="round"
+      />
+    </svg>
   );
 }
 

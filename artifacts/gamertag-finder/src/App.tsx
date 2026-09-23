@@ -41,7 +41,7 @@ export default function App() {
         </CheckerProvider>
       </WouterRouter>
       <Toaster
-        theme="dark"
+        theme="light"
         position="bottom-right"
         toastOptions={{
           className: "rounded-xl border-border bg-card text-foreground",

@@ -105,7 +105,7 @@ export function AppShell({ children }: { children: ReactNode }) {
       {/* Mobile top bar */}
       <div className="sticky top-0 z-30 flex h-14 items-center justify-between border-b border-border bg-background/90 px-4 backdrop-blur lg:hidden">
         <div className="flex items-center gap-2.5">
-          <LogoMark className="h-8" />
+          <LogoMark className="h-8 w-8" />
           <div className="leading-none">
             <span className="block text-[13px] font-bold tracking-[0.1em]">UNIVERSAL CHECKER</span>
             <span className="mt-1 block font-mono text-[10px] tracking-[0.18em] text-muted-foreground">BY SJAF</span>

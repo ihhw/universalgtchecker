@@ -53,7 +53,7 @@ const LEVEL_STYLE: Record<SniperEvent["level"], string> = {
   available: "font-semibold text-primary",
   claim: "text-primary",
   success: "font-semibold text-primary",
-  warn: "text-[hsl(38_80%_60%)]",
+  warn: "text-[hsl(32_55%_38%)]",
   error: "text-destructive",
 };
 
@@ -439,7 +439,7 @@ export default function SniperPage() {
         {(s?.stopReason || s?.claimReason || (s?.backoffUntil && s.backoffUntil > now)) && (
           <div className="mt-3 space-y-1.5 text-[13px] leading-relaxed">
             {s?.backoffUntil && s.backoffUntil > now && (
-              <p className="text-[hsl(38_80%_60%)]">Rate limited by Xbox — next check in {Math.ceil((s.backoffUntil - now) / 1000)}s.</p>
+              <p className="text-[hsl(32_55%_38%)]">Rate limited by Xbox — next check in {Math.ceil((s.backoffUntil - now) / 1000)}s.</p>
             )}
             {s?.claimReason && s.claim !== "disabled" && <p className="text-muted-foreground"><span className="eyebrow mr-2">Claim</span>{s.claimReason}</p>}
             {s?.stopReason && !running && <p className="text-muted-foreground"><span className="eyebrow mr-2">Stopped</span>{s.stopReason}</p>}
