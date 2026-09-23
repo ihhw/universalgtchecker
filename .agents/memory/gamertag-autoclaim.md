@@ -13,12 +13,26 @@ description: How claiming works — reserve → change, BOTH steps now confirmed
 
 Both use `Authorization: XBL3.0 x={uhs};{xsts}` where the XSTS relying party is `http://xboxlive.com`.
 
-## What's actually still unverified
-Only whether a *genuinely available* gamertag produces a **200** success response with the exact tag echoed
-back. Every live test so far has been on a gamertag that turned out to already belong to someone (Xbox's own
-authoritative check said so — see below), so the 2xx/"claimed" code path itself has not yet been exercised
-live. If a future live attempt on a truly free tag returns something other than 200 naming the exact
-gamertag, that response (status + body) is the next thing to capture and react to — don't guess.
+## What's actually still unverified — and an open red flag
+Whether a *genuinely available* gamertag produces a **200** success response with the exact tag echoed back.
+Every live test so far has gotten code 1372 ("belongs to another user") — **five different test strings in a
+row**, including unusual ones like "snowefjajs" and "snowefj". That many consecutive identical rejections is
+suspicious enough to flag explicitly rather than assume it's coincidence:
+- **Plausible innocent explanation**: Xbox now lets many accounts share the same *classic* (display) gamertag,
+  disambiguated by a hidden suffix/discriminator. That means far more strings are "already in use" as someone's
+  display name than the old one-gamertag-per-string model would suggest, so short/plausible-looking test strings
+  colliding repeatedly is more likely than it sounds.
+- **Plausible bug explanation**: the change request isn't correctly linked to the reservation made in step 1, so
+  Xbox runs a broader/different collision check than the one the reservation actually passed.
+- **Response to the bug explanation (2026-09-23)**: added `reservationId: <xuid>` to the change request body
+  (same field/value used at reserve time), on the theory that the two steps need to be explicitly linked. This
+  is a reasoned guess, not a confirmed fix — it has NOT been tested live yet.
+- **The one test that actually distinguishes these two explanations**: have the user attempt the exact same
+  rename through Xbox's own official UI (the Xbox app, or account.xbox.com → profile → customize gamertag) for
+  one of the strings that failed here. If Xbox's own UI also rejects it as taken, the innocent explanation is
+  confirmed and this endpoint is done. If Xbox's own UI succeeds, the request body still needs work — try
+  without `reservationId` again (rule that variable back out) or try PascalCase keys (`Gamertag`,
+  `PreviewOnly`, `ReservationId`) next, informed by whatever exact body the user reports back.
 
 ## Xbox accounts-service error codes seen live (ACCOUNTS_ERROR map in xbox-claim.ts)
 - **1372** = "The gamertag belongs to another user" — the classic (undiscriminated) gamertag string is already

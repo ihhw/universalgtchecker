@@ -366,6 +366,13 @@ export async function claimGamertag(
       change = await send(CHANGE_URL, ctx.authHeader, {
         gamertag,
         previewOnly: false,
+        // Links this change to the reservation just made in step 1. UNVERIFIED:
+        // added because every live test so far got code 1372 ("belongs to
+        // another user") even on unusual strings, which is consistent with
+        // Xbox not finding this change linked to that reservation. If this
+        // field name is wrong Xbox should just ignore it (same behaviour as
+        // before), so this is a safe thing to try.
+        reservationId: ctx.xuid,
       }, CHANGE_TIMEOUT_MS, { method: "POST", contractVersion: "3" });
     } catch (err) {
       record.latency.changeMs = ms(tChange);

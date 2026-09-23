@@ -37,7 +37,7 @@ test("200: reserve + change, Xbox names the exact tag → CLAIMED (change_respon
   const [chg] = calls("change");
   assert.equal(chg!.method, "POST");
   assert.equal(chg!.path, "/accounts.xboxlive.com/users/current/profile/gamertag");
-  assert.deepEqual(chg!.body, { gamertag: "NewTag", previewOnly: false });
+  assert.deepEqual(chg!.body, { gamertag: "NewTag", previewOnly: false, reservationId: "2533274900000001" });
   assert.ok(r.latency.totalMs !== null && r.latency.reserveMs !== null && r.latency.changeMs !== null);
   assert.equal(mock.state.gamertag, "NewTag");
 });
