@@ -18,12 +18,14 @@ are added to the sidebar in `components/app-shell.tsx` as they are integrated.
   `GET /api/activity?only=hits`). The session snapshot (`GET /api/gamertag/sessions/:id`) is authoritative
   and is polled by the UI; SSE is only a realtime enhancement.
 - Claims: every claim (Hits button, Checker auto-claim, Sniper, Discord bot) goes through
-  `api-server/src/lib/xbox-claim.ts`: reserve (`POST gamertag.xboxlive.com/gamertags/reserve`, confirmed
-  working against live Xbox) then change (`POST accounts.xboxlive.com/users/current/profile/gamertag`,
-  `{ gamertag, previewOnly: false }`, contract version 3), authorized with the `http://xboxlive.com` XSTS
-  token. Two earlier change attempts were ruled out by live testing: a `gamertag.xboxlive.com/users/xuid(...)`
-  URL (HTTP 404) and `PUT` to the current URL (HTTP 405 — the code now reads Xbox's `Allow` header on a 405
-  and reports it, so the next wrong guess is diagnosed automatically) — see `.agents/memory/gamertag-autoclaim.md`.
+  `api-server/src/lib/xbox-claim.ts`: reserve (`POST gamertag.xboxlive.com/gamertags/reserve`) then change
+  (`POST accounts.xboxlive.com/users/current/profile/gamertag`, `{ gamertag, previewOnly: false }`, contract
+  version 3), authorized with the `http://xboxlive.com` XSTS token. **Both steps and the URL/method/body shape
+  are confirmed correct against live Xbox** (two earlier change-step guesses were ruled out first by live 404s
+  and a 405 — see `.agents/memory/gamertag-autoclaim.md`). Xbox error code 1372 ("gamertag belongs to another
+  user") is mapped to a plain-language explanation: the availability heuristics (CDN + reserve policy check)
+  can say AVAILABLE for a tag the accounts service still considers taken; the change step is the only fully
+  authoritative check, and only a genuinely free tag has actually exercised the success path so far.
   A claim is `claimed` only when Xbox's response names the exact tag, or a freshly issued XSTS token reports it.
   One claim runs at a time. Checker auto-claim runs server-side and stops after the first confirmed claim.
   Recent claim records: `GET /api/gamertag/claims`.

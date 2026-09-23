@@ -11,6 +11,9 @@
  *   2. POST accounts.xboxlive.com/users/current/profile/gamertag
  *        { gamertag, previewOnly: false }, x-xbl-contract-version: 3
  *      Performs the change using that reservation.
+ *      CONFIRMED against live Xbox: this is the right URL, method and body shape.
+ *      Xbox returns real business-logic responses from it now (e.g. HTTP 400
+ *      with a structured { code, description } body), not routing errors.
  *
  * A result is CLAIMED only when Xbox confirms it: either the change response
  * names exactly the requested gamertag with no suffix, or (when the response
@@ -20,15 +23,14 @@
  *
  * NOTE: these are the endpoints Xbox's own apps use for gamertag changes, per
  * reverse-engineered Xbox Live traffic; they are not officially documented by
- * Microsoft and may change. Endpoints already ruled out by real testing (see
+ * Microsoft and may change. Two earlier guesses for step 2 were ruled out by
+ * real testing before landing on the URL/method above (see
  * .agents/memory/gamertag-autoclaim.md for the full history and exact error
  * bodies):
  *   - PUT gamertag.xboxlive.com/users/xuid(<xuid>)/gamertag        → HTTP 404
  *   - PUT accounts.xboxlive.com/users/current/profile/gamertag     → HTTP 405
- * The POST variant above has NOT yet been confirmed against live Xbox; the
- * next real claim attempt is the actual test. A 405 response now also
- * surfaces Xbox's Allow header, so if this is wrong too we get the exact
- * accepted method(s) without another guess-and-check round.
+ * A 405 response still surfaces Xbox's Allow header verbatim (kept as
+ * defence in depth in case Xbox's accepted method ever changes again).
  */
 
 import { logger } from "./logger";
@@ -158,6 +160,25 @@ function xboxDescription(body: string): string | null {
   } catch { /* not JSON */ }
   return null;
 }
+
+/** Xbox's numeric `code` field on an Accounts-service error body, when present. */
+function xboxErrorCode(body: string): number | null {
+  try {
+    const d = JSON.parse(body) as { code?: unknown };
+    return typeof d.code === "number" ? d.code : null;
+  } catch {
+    return null;
+  }
+}
+
+// Xbox accounts-service error codes worth a specific, honest explanation
+// (confirmed against live Xbox on the accounts.xboxlive.com change endpoint).
+const ACCOUNTS_ERROR: Record<number, string> = {
+  1372: "This exact gamertag is already the live gamertag of another Xbox account right now. " +
+    "The Checker's availability signal (the avatar CDN plus the reserve policy check) can say " +
+    "AVAILABLE for a name Xbox's own account system still considers taken — this final claim step " +
+    "is the only fully authoritative check. Try a target you've independently confirmed is free.",
+};
 
 function sameTag(a: string | null | undefined, b: string): boolean {
   return typeof a === "string" && a.trim().toUpperCase() === b.trim().toUpperCase();
@@ -419,9 +440,12 @@ export async function claimGamertag(
       });
     }
     if (cs === 400) {
+      const code = xboxErrorCode(cBody);
+      const known = code !== null ? ACCOUNTS_ERROR[code] : undefined;
       return finish("claim_failed", {
-        ...cbase, errorCode: "rejected",
-        reason: `Xbox rejected the change (HTTP 400)${cDesc ? `: ${cDesc}` : ""}.`,
+        ...cbase,
+        errorCode: known ? "taken" : "rejected",
+        reason: known ?? `Xbox rejected the change (HTTP 400)${cDesc ? `: ${cDesc}` : ""}.`,
       });
     }
     if (cs === 404) {

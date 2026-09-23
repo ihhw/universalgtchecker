@@ -172,6 +172,34 @@ test("405 at change (wrong HTTP method) → UNKNOWN, never CLAIMED, Allow header
   assert.notEqual(mock.state.gamertag, "MethodTag", "nothing was actually changed");
 });
 
+test("400 at change with Xbox code 1372 → CLAIM FAILED (taken), plain-language reason, never CLAIMED", async () => {
+  await control(mock.url, {
+    queues: {
+      change: [{
+        status: 400,
+        body: { source: "Accounts", code: 1372, description: "The gamertag belongs to another user", data: null, traceInformation: null },
+      }],
+    },
+  });
+  const r = await claim.claimGamertag("OwnedTag", { source: "manual" });
+  assert.equal(r.state, "claim_failed");
+  assert.equal(r.errorCode, "taken");
+  assert.equal(r.httpStatus, 400);
+  assert.match(r.reason ?? "", /already the live gamertag of another Xbox account/);
+  assert.match(r.reason ?? "", /authoritative check/);
+  assert.notEqual(mock.state.gamertag, "OwnedTag");
+});
+
+test("400 at change with an unrecognized Xbox code → CLAIM FAILED (rejected) with Xbox's own description", async () => {
+  await control(mock.url, {
+    queues: { change: [{ status: 400, body: { code: 9999, description: "Something else entirely" } }] },
+  });
+  const r = await claim.claimGamertag("OtherBad", { source: "manual" });
+  assert.equal(r.state, "claim_failed");
+  assert.equal(r.errorCode, "rejected");
+  assert.match(r.reason ?? "", /Something else entirely/);
+});
+
 test("timeout at reserve → NETWORK ERROR; timeout at change → UNKNOWN", async () => {
   await control(mock.url, { queues: { reserve: [{ delayMs: 2_500, status: 200, body: {} }] } });
   const r1 = await claim.claimGamertag("SlowRes", { source: "manual" });
