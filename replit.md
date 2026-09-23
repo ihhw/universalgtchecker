@@ -19,16 +19,17 @@ are added to the sidebar in `components/app-shell.tsx` as they are integrated.
   and is polled by the UI; SSE is only a realtime enhancement.
 - Claims: every claim (Hits button, Checker auto-claim, Sniper, Discord bot) goes through
   `api-server/src/lib/xbox-claim.ts`: reserve (`POST gamertag.xboxlive.com/gamertags/reserve`) then change
-  (`POST accounts.xboxlive.com/users/current/profile/gamertag`, `{ gamertag, previewOnly: false,
-  reservationId: <xuid> }`, contract version 3), authorized with the `http://xboxlive.com` XSTS token. **The
-  URL and method are confirmed correct against live Xbox** (two earlier change-step guesses were ruled out
-  first by live 404s and a 405). The success (200, claimed) path is NOT yet confirmed live — every live
-  attempt so far has hit Xbox error code 1372 ("gamertag belongs to another user") on every tested string,
-  which is either expected (Xbox's shared/discriminator gamertag system) or a sign the request body still
-  needs work; see `.agents/memory/gamertag-autoclaim.md` for the open question and how to resolve it. Xbox
-  error code 1372 is mapped to a plain-language explanation: the availability heuristics (CDN + reserve policy
-  check) can say AVAILABLE for a tag the accounts service still considers taken; the change step is the only fully
-  authoritative check, and only a genuinely free tag has actually exercised the success path so far.
+  (`POST accounts.xboxlive.com/users/current/profile/gamertag`, `{ Gamertag, PreviewOnly: false,
+  ReservationId: <xuid> }`, contract version 3), authorized with the `http://xboxlive.com` XSTS token. **The
+  URL and method are confirmed correct against live Xbox**, and adding `ReservationId` is confirmed to fix an
+  earlier false "gamertag belongs to another user" (code 1372) rejection that hit every tested string. The
+  success (200, actually-applied) path is still NOT confirmed live — the last live attempt got HTTP 200 with
+  body `{"hasFree":true}` and no applied change (the claim engine correctly reported this as UNKNOWN, not
+  CLAIMED); the body was switched to PascalCase in response but that hasn't been tested live yet. See
+  `.agents/memory/gamertag-autoclaim.md` for the full timeline and what to try next. Xbox error code 1372 is
+  mapped to a plain-language explanation: the availability heuristics (CDN + reserve policy check) can say
+  AVAILABLE for a tag the accounts service still considers taken; the change step is the only fully
+  authoritative check.
   A claim is `claimed` only when Xbox's response names the exact tag, or a freshly issued XSTS token reports it.
   One claim runs at a time. Checker auto-claim runs server-side and stops after the first confirmed claim.
   Recent claim records: `GET /api/gamertag/claims`.

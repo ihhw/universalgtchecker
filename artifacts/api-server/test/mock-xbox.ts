@@ -200,11 +200,12 @@ export function startMockXbox(port = 0): Promise<{ url: string; state: MockState
         }
         case "change": {
           if (!xstsOk) { send(401, {}); return; }
-          const gt = String(b["gamertag"] ?? "");
+          const gt = String(b["Gamertag"] ?? "");
+          if (b["ReservationId"] !== state.xuid) { send(400, { source: "Accounts", code: 1372, description: "The gamertag belongs to another user" }); return; }
           if (state.reservations.get(gt.toUpperCase()) !== state.xuid) { send(409, { description: "No reservation" }); return; }
           state.gamertag = gt;
           state.taken.add(gt.toUpperCase());
-          send(200, { gamertag: gt, gamertagSuffix: "" });
+          send(200, { Gamertag: gt, GamertagSuffix: "" });
           return;
         }
         default:

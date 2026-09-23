@@ -9,11 +9,14 @@
  *      Reserves the exact name for this account. 409 = taken/reserved elsewhere.
  *      CONFIRMED against live Xbox: this call succeeds (accepts the reservation).
  *   2. POST accounts.xboxlive.com/users/current/profile/gamertag
- *        { gamertag, previewOnly: false }, x-xbl-contract-version: 3
+ *        { Gamertag, PreviewOnly: false, ReservationId: <xuid> }, x-xbl-contract-version: 3
  *      Performs the change using that reservation.
- *      CONFIRMED against live Xbox: this is the right URL, method and body shape.
- *      Xbox returns real business-logic responses from it now (e.g. HTTP 400
- *      with a structured { code, description } body), not routing errors.
+ *      CONFIRMED against live Xbox: this is the right URL and method. Xbox
+ *      returns real business-logic responses from it (e.g. HTTP 400 with a
+ *      structured { code, description } body), not routing errors.
+ *      The success (200, actually-applied) response has NOT yet been
+ *      confirmed live — see .agents/memory/gamertag-autoclaim.md for the
+ *      current state of that investigation before changing this body again.
  *
  * A result is CLAIMED only when Xbox confirms it: either the change response
  * names exactly the requested gamertag with no suffix, or (when the response
@@ -23,12 +26,17 @@
  *
  * NOTE: these are the endpoints Xbox's own apps use for gamertag changes, per
  * reverse-engineered Xbox Live traffic; they are not officially documented by
- * Microsoft and may change. Two earlier guesses for step 2 were ruled out by
- * real testing before landing on the URL/method above (see
- * .agents/memory/gamertag-autoclaim.md for the full history and exact error
- * bodies):
+ * Microsoft and may change. Ruled out by real testing before landing on the
+ * URL/method/body above (see .agents/memory/gamertag-autoclaim.md for the
+ * full history and exact error bodies):
  *   - PUT gamertag.xboxlive.com/users/xuid(<xuid>)/gamertag        → HTTP 404
  *   - PUT accounts.xboxlive.com/users/current/profile/gamertag     → HTTP 405
+ *   - POST .../gamertag, lowercase body, no ReservationId          → HTTP 400
+ *     code 1372 "belongs to another user", on every tested string
+ *   - POST .../gamertag, lowercase body + ReservationId            → HTTP 200
+ *     but body {"hasFree":true} with no gamertag confirmation, and the
+ *     account's own identity afterward showed the change did NOT apply —
+ *     reads as an eligibility/preview answer, not a performed write
  * A 405 response still surfaces Xbox's Allow header verbatim (kept as
  * defence in depth in case Xbox's accepted method ever changes again).
  */
@@ -364,15 +372,19 @@ export async function claimGamertag(
     let change;
     try {
       change = await send(CHANGE_URL, ctx.authHeader, {
-        gamertag,
-        previewOnly: false,
-        // Links this change to the reservation just made in step 1. UNVERIFIED:
-        // added because every live test so far got code 1372 ("belongs to
-        // another user") even on unusual strings, which is consistent with
-        // Xbox not finding this change linked to that reservation. If this
-        // field name is wrong Xbox should just ignore it (same behaviour as
-        // before), so this is a safe thing to try.
-        reservationId: ctx.xuid,
+        // PascalCase: a lowercase body got a real HTTP 200 back but with body
+        // {"hasFree":true} — no gamertag confirmation, and the account's
+        // XSTS identity afterward still showed the OLD gamertag. That reads
+        // as Xbox answering an eligibility/preview question rather than
+        // performing the write, consistent with previewOnly/gamertag not
+        // being recognized and silently defaulting. Xbox's other APIs here
+        // (XBL/XSTS auth bodies) are all PascalCase, so trying that shape.
+        Gamertag: gamertag,
+        PreviewOnly: false,
+        // Links this change to the reservation from step 1. CONFIRMED useful:
+        // the same target that got HTTP 400 "belongs to another user" three
+        // times in a row without this field got a real 200 once it was added.
+        ReservationId: ctx.xuid,
       }, CHANGE_TIMEOUT_MS, { method: "POST", contractVersion: "3" });
     } catch (err) {
       record.latency.changeMs = ms(tChange);
@@ -398,9 +410,12 @@ export async function claimGamertag(
       let assigned: string | null = null;
       let suffix = "";
       try {
-        const d = JSON.parse(cBody) as { classicGamertag?: string; gamertag?: string; Gamertag?: string; gamertagSuffix?: string };
+        const d = JSON.parse(cBody) as {
+          classicGamertag?: string; gamertag?: string; Gamertag?: string;
+          gamertagSuffix?: string; GamertagSuffix?: string;
+        };
         assigned = d.classicGamertag ?? d.gamertag ?? d.Gamertag ?? null;
-        suffix = (d.gamertagSuffix ?? "").trim();
+        suffix = (d.gamertagSuffix ?? d.GamertagSuffix ?? "").trim();
       } catch { /* no JSON body */ }
 
       if (assigned && sameTag(assigned, gamertag) && !suffix) {
