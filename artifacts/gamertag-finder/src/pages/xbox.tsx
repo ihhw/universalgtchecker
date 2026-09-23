@@ -1,0 +1,204 @@
+import type { CSSProperties } from "react";
+import { Pause, Play, Square } from "lucide-react";
+import { Switch } from "@/components/ui/switch";
+import { Panel, Eyebrow, PageHeader } from "@/components/panel";
+import { ActivityFeed } from "@/components/activity-feed";
+import { ModeForm, ModePicker, TemplatesPanel } from "@/components/mode-form";
+import { useChecker, type ConfigValidation } from "@/state/checker";
+import { MODE_BY_ID } from "@/lib/modes";
+import { cn } from "@/lib/utils";
+
+function Stat({ label, value, accent }: { label: string; value: number; accent?: boolean }) {
+  return (
+    <div className="rounded-lg border border-border bg-[hsl(var(--well))] px-4 py-3">
+      <p className="eyebrow">{label}</p>
+      <p className={cn("tabular mt-1.5 text-2xl font-semibold", accent && "text-primary")}>
+        {value.toLocaleString()}
+      </p>
+    </div>
+  );
+}
+
+function Option({
+  id, title, description, checked, onChange, disabled,
+}: {
+  id: string; title: string; description: string;
+  checked: boolean; onChange: (v: boolean) => void; disabled?: boolean;
+}) {
+  return (
+    <div className="flex items-start justify-between gap-4 py-4 first:pt-0 last:pb-0">
+      <div className="min-w-0">
+        <label htmlFor={id} className="text-sm font-medium">{title}</label>
+        <p className="mt-1 max-w-lg text-xs leading-relaxed text-muted-foreground">{description}</p>
+      </div>
+      <Switch id={id} checked={checked} onCheckedChange={onChange} disabled={disabled} className="mt-0.5 shrink-0" />
+    </div>
+  );
+}
+
+/** Validation comes from the server; the UI only displays it. */
+function ConfigStatus({ v }: { v: ConfigValidation }) {
+  if (v.status === "checking") {
+    return <p className="mt-3 text-xs text-muted-foreground" role="status">Checking settings…</p>;
+  }
+  if (v.status === "error") {
+    const shown = v.errors.slice(0, 6);
+    return (
+      <div role="alert" className="mt-3 rounded-lg border border-destructive/40 bg-destructive/[0.06] px-3.5 py-3">
+        <ul className="space-y-1 text-[13px]">
+          {shown.map((e) => <li key={e}>{e}</li>)}
+        </ul>
+        {v.errors.length > shown.length && (
+          <p className="mt-1.5 text-xs text-muted-foreground">+{v.errors.length - shown.length} more</p>
+        )}
+      </div>
+    );
+  }
+  return (
+    <p className="mt-3 flex items-center gap-2 text-xs text-muted-foreground" role="status">
+      <span aria-hidden="true" className="h-1.5 w-1.5 rounded-full bg-primary" />
+      Ready
+      {v.info.count !== undefined && ` · ${v.info.count.toLocaleString()} ${v.info.count === 1 ? "name" : "names"}`}
+      {v.info.skipped ? ` · ${v.info.skipped.toLocaleString()} invalid skipped` : ""}
+    </p>
+  );
+}
+
+export default function XboxPage() {
+  const c = useChecker();
+  const s = c.snapshot;
+  const fill = ((c.rate - 1) / 999) * 100;
+  const def = MODE_BY_ID[c.mode]!;
+  const canStart = c.validation.status === "ok";
+
+  return (
+    <>
+      <PageHeader title="Xbox" />
+
+      <div className="space-y-4">
+        <Panel>
+          <Eyebrow>Mode</Eyebrow>
+          <div className="mt-4">
+            <ModePicker mode={c.mode} onSelect={c.setMode} disabled={c.isRunning} />
+          </div>
+
+          {c.mode === "templates" ? (
+            <TemplatesPanel
+              builtin={c.builtinTemplates}
+              saved={c.savedTemplates}
+              onApply={c.applyTemplate}
+              onSave={c.saveTemplate}
+              onDelete={c.deleteTemplate}
+              saveLabel={c.templateSourceLabel}
+              disabled={c.isRunning}
+            />
+          ) : (
+            <>
+              <ModeForm mode={def} params={c.params} onChange={c.setParams} disabled={c.isRunning} />
+              <ConfigStatus v={c.validation} />
+            </>
+          )}
+
+          <div className="mt-5 flex flex-wrap items-center gap-2.5">
+            {c.isRunning ? (
+              <>
+                <button
+                  type="button"
+                  onClick={() => void c.togglePause()}
+                  className="inline-flex items-center gap-2 rounded-lg border border-primary/50 px-5 py-2.5 text-sm font-medium text-primary transition-colors hover:bg-primary/10"
+                >
+                  {c.isPaused ? <Play className="h-4 w-4" /> : <Pause className="h-4 w-4" />}
+                  {c.isPaused ? "Resume" : "Pause"}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void c.stop()}
+                  className="inline-flex items-center gap-2 rounded-lg border border-border px-5 py-2.5 text-sm transition-colors hover:bg-secondary"
+                >
+                  <Square className="h-4 w-4" />
+                  Stop
+                </button>
+                <span className="tabular ml-1 font-mono text-xs text-muted-foreground" role="status">
+                  {c.isPaused ? "Paused" : `Running · ${s?.cps ?? 0}/s`}
+                </span>
+              </>
+            ) : (
+              <>
+                <button
+                  type="button"
+                  onClick={() => void c.start()}
+                  disabled={c.starting || !canStart}
+                  className="rounded-lg bg-primary px-6 py-2.5 text-sm font-semibold text-primary-foreground transition-opacity hover:opacity-90 disabled:opacity-50"
+                >
+                  {c.starting ? "Starting…" : "Start"}
+                </button>
+                <button
+                  type="button"
+                  onClick={c.reset}
+                  className="rounded-lg border border-border px-5 py-2.5 text-sm transition-colors hover:bg-secondary"
+                >
+                  Reset
+                </button>
+                {s?.state === "completed" && (
+                  <span className="font-mono text-xs text-muted-foreground" role="status">Completed</span>
+                )}
+              </>
+            )}
+          </div>
+
+          <div className="mt-5 border-t border-border pt-5">
+            <div className="flex items-center justify-between">
+              <label htmlFor="rate" className="text-sm font-medium">Rate</label>
+              <span className="tabular font-mono text-sm text-primary">{c.rate}/s</span>
+            </div>
+            <input
+              id="rate"
+              type="range"
+              min={1}
+              max={1000}
+              step={1}
+              value={c.rate}
+              disabled={c.isRunning}
+              onChange={(e) => c.setRate(Number(e.target.value))}
+              style={{ "--fill": `${fill}%` } as CSSProperties}
+              className="range mt-2"
+            />
+
+            <div className="mt-4">
+              <Option
+                id="double-check"
+                title="Double Check"
+                description="Verifies Xbox gamertag availability through an additional policy check before a username can be confirmed as available."
+                checked={c.doubleCheck}
+                onChange={(v) => {
+                  if (v && !c.isAuthed) { c.setConnectOpen(true); return; }
+                  c.setDoubleCheck(v);
+                }}
+                disabled={c.isRunning}
+              />
+            </div>
+          </div>
+        </Panel>
+
+        <Panel>
+          <Eyebrow>Progress</Eyebrow>
+          <div className="mt-4 grid grid-cols-2 gap-2.5 sm:grid-cols-3 lg:grid-cols-5">
+            <Stat label="Checked" value={s?.attempts ?? 0} />
+            <Stat label="Available" value={s?.found ?? 0} accent />
+            <Stat label="Taken" value={s?.taken ?? 0} />
+            <Stat label="Unknown" value={s?.unknown ?? 0} />
+            <Stat label="Saved" value={c.saved.length} />
+          </div>
+        </Panel>
+
+        <ActivityFeed
+          title="Live feed"
+          events={c.feed}
+          connected={c.feedConnected}
+          onClear={c.clearFeed}
+          platform="xbox"
+        />
+      </div>
+    </>
+  );
+}

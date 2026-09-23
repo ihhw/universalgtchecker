@@ -1,0 +1,16 @@
+[Unit]
+Description=Universal Checker Discord bot
+After=network-online.target universal-checker.service
+Wants=universal-checker.service
+
+[Service]
+Type=simple
+WorkingDirectory=__BOT_DIR__
+ExecStart=__BOT_DIR__/.venv/bin/python3 __BOT_DIR__/bot.py
+EnvironmentFile=__BOT_ENV_FILE__
+Environment=GAMERTAG_API_URL=http://127.0.0.1:__PORT__/api
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

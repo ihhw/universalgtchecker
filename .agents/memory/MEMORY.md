@@ -1,0 +1,8 @@
+- [Xbox Gamertag Checker Architecture](gamertag-checker-arch.md) — Node.js concurrent workers (not Python asyncio); N workers × 1 check/sec = N CPS; CDN fallback for unauthenticated checks
+- [Auto-Claim Endpoint](gamertag-autoclaim.md) — PUT to gamertag.xboxlive.com/gamertags/{gt}; Xbox API may reject or need XUID; userHash optional; clear error shapes in response
+- [Generated Type Files](gamertag-codegen.md) — Orval-generated files manually patched (not regenerated); all four places must stay in sync: openapi.yaml, api-zod generated, api-client-react schemas, api-client-react api.ts
+- [Xbox Policy Reservation](xbox-policy-reservation.md) — Ethan’s reserve check can use the signed-in account XUID as reservationId; no separate browser token flow is needed
+- [Discord Command Permissions](discord-command-permissions.md) — slash commands work with default intents; legacy ! commands require Discord Message Content Intent
+- [Search Control Reliability](search-control-reliability.md) — keep polling session snapshots alongside SSE so UI controls and progress survive interrupted streams
+- [Discord Result Delivery](discord-result-delivery.md) — use the successful interaction follow-up for slash-command updates; channel.send can fail with Missing Access
+- [Ethan Approval Gate](ethan-approval-gate.md) — when enabled, only policy-approved primary results may be emitted as available alerts

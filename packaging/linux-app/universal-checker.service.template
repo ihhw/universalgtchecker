@@ -1,0 +1,15 @@
+[Unit]
+Description=Universal Checker server
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=__DATA_DIR__
+ExecStart=__BIN_DIR__/run-server.sh
+Restart=on-failure
+RestartSec=2
+Environment=NODE_ENV=production
+Environment=PORT=__PORT__
+
+[Install]
+WantedBy=default.target

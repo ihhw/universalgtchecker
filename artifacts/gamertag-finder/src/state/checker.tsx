@@ -1,0 +1,461 @@
+import {
+  createContext, useCallback, useContext, useEffect, useMemo, useRef, useState,
+  type ReactNode,
+} from "react";
+import { toast } from "sonner";
+import type { GamertagSearchInput, GamertagSession, GenerationMode } from "@workspace/api-client-react";
+import { api, readStored, writeStored, type ActivityEvent } from "@/lib/api";
+import {
+  BUILTIN_TEMPLATES, MODE_BY_ID, defaultParamsByMode, persistableParams,
+  type Params, type TemplateDef,
+} from "@/lib/modes";
+import { useActivityFeed } from "@/hooks/use-activity-feed";
+import { useSessionSnapshot, type SessionSnapshot } from "@/hooks/use-session-snapshot";
+import { useXboxAuth } from "@/hooks/use-xbox-auth";
+
+export type ClaimStatus =
+  | "idle" | "claiming" | "claimed" | "error"
+  | "rate_limited" | "auth_failed" | "rejected" | "auth_required";
+
+export interface ConfigValidation {
+  status: "checking" | "ok" | "error";
+  errors: string[];
+  label: string;
+  /** List mode: number of names, and invalid entries skipped on request. */
+  info: { count?: number; skipped?: number };
+}
+
+const SESSION_KEY = "universal-xbox-session";
+const SAVED_KEY = "gtag-saved";
+const DOUBLE_CHECK_KEY = "gtag-ethan-policy";
+const AUTOCLAIM_KEY = "gtag-autoclaim";
+const RATE_KEY = "universal-xbox-rate";
+const MODE_KEY = "universal-xbox-mode";
+const PARAMS_KEY = "universal-xbox-params";
+const TEMPLATES_KEY = "universal-xbox-templates";
+const MAX_SAVED_TEMPLATES = 20;
+
+interface CheckerContextValue {
+  // generation settings
+  mode: string;
+  setMode: (id: string) => void;
+  params: Params;
+  setParams: (patch: Params) => void;
+  validation: ConfigValidation;
+  builtinTemplates: TemplateDef[];
+  savedTemplates: TemplateDef[];
+  applyTemplate: (t: TemplateDef) => void;
+  saveTemplate: (name: string) => void;
+  deleteTemplate: (id: string) => void;
+  templateSourceLabel: string;
+  // search settings
+  rate: number;
+  setRate: (n: number) => void;
+  doubleCheck: boolean;
+  setDoubleCheck: (v: boolean) => void;
+  autoClaim: boolean;
+  setAutoClaim: (v: boolean) => void;
+  // session
+  sessionId: string | null;
+  snapshot: SessionSnapshot | null;
+  isRunning: boolean;
+  isPaused: boolean;
+  starting: boolean;
+  start: () => Promise<void>;
+  stop: () => Promise<void>;
+  togglePause: () => Promise<void>;
+  reset: () => void;
+  // feed + hits
+  feed: ActivityEvent[];
+  feedConnected: boolean;
+  clearFeed: () => void;
+  hits: ActivityEvent[];
+  // saved + claim
+  saved: string[];
+  save: (tag: string) => void;
+  unsave: (tag: string) => void;
+  exportSaved: () => void;
+  claimStatuses: Map<string, ClaimStatus>;
+  claim: (tag: string) => Promise<void>;
+  // xbox account
+  auth: ReturnType<typeof useXboxAuth>;
+  isAuthed: boolean;
+  connectOpen: boolean;
+  setConnectOpen: (open: boolean) => void;
+}
+
+const CheckerContext = createContext<CheckerContextValue | null>(null);
+
+export function useChecker(): CheckerContextValue {
+  const ctx = useContext(CheckerContext);
+  if (!ctx) throw new Error("useChecker must be used inside CheckerProvider");
+  return ctx;
+}
+
+/**
+ * The claim API returns several specific error codes. Collapse them into the
+ * few states the UI knows how to render, so a button label is never blank.
+ */
+function toClaimStatus(code: string | undefined): ClaimStatus {
+  switch (code) {
+    case "rate_limited":
+    case "auth_failed":
+    case "auth_required":
+    case "rejected":
+      return code;
+    case "invalid_gamertag":
+    case "taken":
+    case "suffix_required":
+    case "suffix_assigned":
+    case "not_found":
+      return "rejected";
+    default:
+      return "error";
+  }
+}
+
+function readSaved(): string[] {
+  try {
+    const raw = readStored(SAVED_KEY);
+    const parsed = raw ? (JSON.parse(raw) as unknown) : [];
+    return Array.isArray(parsed) ? parsed.filter((x): x is string => typeof x === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+const isPlainObject = (v: unknown): v is Record<string, unknown> =>
+  typeof v === "object" && v !== null && !Array.isArray(v);
+
+function readParams(): Record<string, Params> {
+  const base = defaultParamsByMode();
+  try {
+    const raw = readStored(PARAMS_KEY);
+    const parsed: unknown = raw ? JSON.parse(raw) : null;
+    if (isPlainObject(parsed)) {
+      for (const [id, p] of Object.entries(parsed)) {
+        if (id in base && isPlainObject(p)) base[id] = { ...base[id], ...p };
+      }
+    }
+  } catch { /* fall back to defaults */ }
+  return base;
+}
+
+function readTemplates(): TemplateDef[] {
+  try {
+    const raw = readStored(TEMPLATES_KEY);
+    const parsed: unknown = raw ? JSON.parse(raw) : [];
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(
+      (t): t is TemplateDef =>
+        isPlainObject(t) && typeof t["id"] === "string" && typeof t["label"] === "string" &&
+        typeof t["mode"] === "string" && t["mode"] in MODE_BY_ID && isPlainObject(t["params"]),
+    ).slice(0, MAX_SAVED_TEMPLATES);
+  } catch {
+    return [];
+  }
+}
+
+export function CheckerProvider({ children }: { children: ReactNode }) {
+  const [mode, setModeState] = useState<string>(() => {
+    const stored = readStored(MODE_KEY);
+    return stored && stored in MODE_BY_ID ? stored : "letters";
+  });
+  const [lastRealMode, setLastRealMode] = useState<string>(() => (mode === "templates" ? "letters" : mode));
+  const [paramsByMode, setParamsByMode] = useState<Record<string, Params>>(readParams);
+  const [savedTemplates, setSavedTemplates] = useState<TemplateDef[]>(readTemplates);
+  const [validation, setValidation] = useState<ConfigValidation>({ status: "checking", errors: [], label: "", info: {} });
+
+  const [rate, setRateState] = useState(() => {
+    const n = Number(readStored(RATE_KEY));
+    return Number.isFinite(n) && n >= 1 && n <= 1000 ? Math.round(n) : 8;
+  });
+  const [doubleCheck, setDoubleCheckState] = useState(() => readStored(DOUBLE_CHECK_KEY) === "true");
+  const [autoClaim, setAutoClaimState] = useState(() => readStored(AUTOCLAIM_KEY) === "true");
+
+  const [sessionId, setSessionId] = useState<string | null>(() => {
+    try { return sessionStorage.getItem(SESSION_KEY); } catch { return null; }
+  });
+  const [starting, setStarting] = useState(false);
+  const startingRef = useRef(false);
+  const claimFloor = useRef(0);
+  const claimsInFlight = useRef(new Set<string>());
+
+  const [saved, setSaved] = useState<string[]>(readSaved);
+  const [claimStatuses, setClaimStatuses] = useState<Map<string, ClaimStatus>>(new Map());
+  const [connectOpen, setConnectOpen] = useState(false);
+
+  const auth = useXboxAuth();
+  const isAuthed = auth.status?.authenticated === true;
+  const { events: feed, hits, connected: feedConnected, clear: clearFeed, latestEventId } = useActivityFeed();
+
+  const params = paramsByMode[mode] ?? {};
+
+  const persistSession = useCallback((id: string | null) => {
+    setSessionId(id);
+    try {
+      if (id) sessionStorage.setItem(SESSION_KEY, id);
+      else sessionStorage.removeItem(SESSION_KEY);
+    } catch { /* storage unavailable */ }
+  }, []);
+
+  const handleMissing = useCallback(() => {
+    persistSession(null);
+    toast.info("The search session ended on the server.");
+  }, [persistSession]);
+  const { snapshot, refresh } = useSessionSnapshot(sessionId, handleMissing);
+
+  // ── Generation settings ────────────────────────────────────────────────────
+  const setMode = useCallback((id: string) => {
+    if (!(id in MODE_BY_ID)) return;
+    setModeState(id);
+    writeStored(MODE_KEY, id);
+    if (id !== "templates") setLastRealMode(id);
+  }, []);
+
+  const setParams = useCallback((patch: Params) => {
+    setParamsByMode((prev) => ({ ...prev, [mode]: { ...prev[mode], ...patch } }));
+  }, [mode]);
+
+  useEffect(() => {
+    const out: Record<string, Params> = {};
+    for (const [id, p] of Object.entries(paramsByMode)) out[id] = persistableParams(id, p);
+    writeStored(PARAMS_KEY, JSON.stringify(out));
+  }, [paramsByMode]);
+
+  useEffect(() => { writeStored(TEMPLATES_KEY, JSON.stringify(savedTemplates)); }, [savedTemplates]);
+
+  const applyTemplate = useCallback((t: TemplateDef) => {
+    const def = MODE_BY_ID[t.mode];
+    if (!def) return;
+    setParamsByMode((prev) => ({ ...prev, [t.mode]: { ...def.defaults, ...t.params } }));
+    setMode(t.mode);
+  }, [setMode]);
+
+  const saveTemplate = useCallback((name: string) => {
+    if (lastRealMode === "list") {
+      toast.error("List settings can't be saved as a template.");
+      return;
+    }
+    const def = MODE_BY_ID[lastRealMode];
+    if (!def) return;
+    const tpl: TemplateDef = {
+      id: `user-${Date.now().toString(36)}`,
+      label: name.slice(0, 40),
+      hint: def.label,
+      mode: lastRealMode,
+      params: persistableParams(lastRealMode, paramsByMode[lastRealMode] ?? {}),
+    };
+    setSavedTemplates((prev) => [tpl, ...prev].slice(0, MAX_SAVED_TEMPLATES));
+    toast.success(`Saved template "${tpl.label}"`);
+  }, [lastRealMode, paramsByMode]);
+
+  const deleteTemplate = useCallback((id: string) => {
+    setSavedTemplates((prev) => prev.filter((t) => t.id !== id));
+  }, []);
+
+  // The server is the only authority on whether settings are valid.
+  useEffect(() => {
+    if (mode === "templates") {
+      setValidation({ status: "error", errors: ["Choose a template to continue."], label: "", info: {} });
+      return;
+    }
+    setValidation((v) => ({ ...v, status: "checking" }));
+    const controller = new AbortController();
+    const timer = setTimeout(async () => {
+      try {
+        const res = await fetch(api("/gamertag/config/validate"), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ config: { mode, params } }),
+          signal: controller.signal,
+        });
+        const d = (await res.json()) as { valid?: boolean; errors?: string[]; label?: string; info?: ConfigValidation["info"] };
+        setValidation({
+          status: d.valid === true ? "ok" : "error",
+          errors: Array.isArray(d.errors) ? d.errors : [],
+          label: d.label ?? "",
+          info: d.info ?? {},
+        });
+      } catch {
+        if (controller.signal.aborted) return;
+        setValidation({ status: "error", errors: ["Could not validate these settings. Is the API reachable?"], label: "", info: {} });
+      }
+    }, 350);
+    return () => { clearTimeout(timer); controller.abort(); };
+  }, [mode, params]);
+
+  // ── Search settings ────────────────────────────────────────────────────────
+  const setRate = useCallback((n: number) => {
+    const v = Math.min(1000, Math.max(1, Math.round(n) || 1));
+    setRateState(v);
+    writeStored(RATE_KEY, String(v));
+  }, []);
+  const setDoubleCheck = useCallback((v: boolean) => { setDoubleCheckState(v); writeStored(DOUBLE_CHECK_KEY, String(v)); }, []);
+  const setAutoClaim = useCallback((v: boolean) => { setAutoClaimState(v); writeStored(AUTOCLAIM_KEY, String(v)); }, []);
+
+  // ── Session controls ───────────────────────────────────────────────────────
+  const isRunning = sessionId !== null && (snapshot === null || snapshot.state === "running");
+  const isPaused = snapshot?.paused === true && isRunning;
+
+  const start = useCallback(async () => {
+    // Guard against a double click starting two sessions.
+    if (startingRef.current || isRunning) return;
+    if (validation.status !== "ok") {
+      toast.error(validation.errors[0] ?? "Fix the settings before starting.");
+      return;
+    }
+    if (doubleCheck && !isAuthed) {
+      toast.info("Connect Xbox to use Double Check.");
+      setConnectOpen(true);
+      return;
+    }
+    startingRef.current = true;
+    setStarting(true);
+    try {
+      claimFloor.current = latestEventId();
+      const body: GamertagSearchInput = {
+        config: { mode: mode as GenerationMode, params },
+        rate,
+        runEthanPolicyCheck: doubleCheck,
+      };
+      const res = await fetch(api("/gamertag/search"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (res.status === 201) {
+        const session = (await res.json()) as GamertagSession;
+        setClaimStatuses(new Map());
+        persistSession(session.sessionId);
+        toast.success("Search started");
+      } else {
+        const d = (await res.json().catch(() => ({}))) as { error?: string; errors?: string[] };
+        toast.error(d.errors?.[0] ?? d.error ?? "Could not start the search.");
+      }
+    } catch {
+      toast.error("Could not start the search. Check that the API is reachable.");
+    } finally {
+      startingRef.current = false;
+      setStarting(false);
+    }
+  }, [isRunning, validation, doubleCheck, isAuthed, latestEventId, mode, params, rate, persistSession]);
+
+  const stop = useCallback(async () => {
+    if (!sessionId) return;
+    try {
+      const res = await fetch(api(`/gamertag/sessions/${encodeURIComponent(sessionId)}`), { method: "DELETE" });
+      if (res.ok || res.status === 404) {
+        refresh();
+        toast.info("Search stopped");
+      } else {
+        toast.error("The server could not confirm the stop. Try again.");
+      }
+    } catch {
+      toast.error("Could not reach the server to stop the search.");
+    }
+  }, [sessionId, refresh]);
+
+  const togglePause = useCallback(async () => {
+    if (!sessionId) return;
+    const action = isPaused ? "resume" : "pause";
+    try {
+      const res = await fetch(api(`/gamertag/sessions/${encodeURIComponent(sessionId)}/${action}`), { method: "POST" });
+      if (!res.ok) throw new Error(String(res.status));
+      refresh(); // the snapshot, not local state, decides what the UI shows
+    } catch {
+      toast.error(`Could not ${action} the search.`);
+    }
+  }, [sessionId, isPaused, refresh]);
+
+  const reset = useCallback(() => {
+    if (isRunning) return;
+    persistSession(null);
+    clearFeed();
+    setClaimStatuses(new Map());
+  }, [isRunning, persistSession, clearFeed]);
+
+  // ── Saved tags ─────────────────────────────────────────────────────────────
+  useEffect(() => { writeStored(SAVED_KEY, JSON.stringify(saved)); }, [saved]);
+  const save = useCallback((tag: string) => {
+    setSaved((prev) => (prev.includes(tag) ? prev : [...prev, tag]));
+    toast.success(`Saved ${tag}`);
+  }, []);
+  const unsave = useCallback((tag: string) => setSaved((prev) => prev.filter((t) => t !== tag)), []);
+  const exportSaved = useCallback(() => {
+    if (saved.length === 0) return;
+    const url = URL.createObjectURL(new Blob([saved.join("\n")], { type: "text/plain" }));
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "saved-gamertags.txt";
+    a.click();
+    URL.revokeObjectURL(url);
+  }, [saved]);
+
+  // ── Claim ──────────────────────────────────────────────────────────────────
+  // A claim counts as successful only when the server reports success: Xbox
+  // confirmed it. Available and Double Check approved are separate states.
+  const claim = useCallback(async (gamertag: string) => {
+    if (!isAuthed) {
+      toast.error("Connect Xbox to claim gamertags.");
+      setConnectOpen(true);
+      return;
+    }
+    const key = gamertag.toUpperCase();
+    // Synchronous guard: two rapid clicks can never send two requests.
+    if (claimsInFlight.current.has(key)) return;
+    claimsInFlight.current.add(key);
+    setClaimStatuses((prev) => new Map(prev).set(gamertag, "claiming"));
+    try {
+      const res = await fetch(api("/gamertag/claim"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ gamertag }),
+      });
+      const data = (await res.json()) as { success?: boolean; error?: string; message?: string };
+      if (res.ok && data.success === true) {
+        setClaimStatuses((prev) => new Map(prev).set(gamertag, "claimed"));
+        toast.success(`Claimed ${gamertag}`, { duration: 8000 });
+      } else {
+        setClaimStatuses((prev) => new Map(prev).set(gamertag, toClaimStatus(data.error)));
+        toast.error(data.message ?? `Could not claim ${gamertag}`);
+      }
+    } catch {
+      setClaimStatuses((prev) => new Map(prev).set(gamertag, "error"));
+      toast.error(`Network error while claiming ${gamertag}`);
+    } finally {
+      claimsInFlight.current.delete(key);
+    }
+  }, [isAuthed]);
+
+  // ── Auto-claim: only hits from this browser's own active session ───────────
+  const attemptedClaims = useRef(new Set<string>());
+  useEffect(() => {
+    if (!autoClaim || !isAuthed || !sessionId) return;
+    for (const hit of hits) {
+      if (hit.id <= claimFloor.current || hit.sessionId !== sessionId) continue;
+      if (attemptedClaims.current.has(hit.username)) continue;
+      attemptedClaims.current.add(hit.username);
+      void claim(hit.username);
+    }
+  }, [hits, autoClaim, isAuthed, sessionId, claim]);
+
+  const value = useMemo<CheckerContextValue>(() => ({
+    mode, setMode, params, setParams, validation,
+    builtinTemplates: BUILTIN_TEMPLATES, savedTemplates, applyTemplate, saveTemplate, deleteTemplate,
+    templateSourceLabel: MODE_BY_ID[lastRealMode]?.label ?? "",
+    rate, setRate, doubleCheck, setDoubleCheck, autoClaim, setAutoClaim,
+    sessionId, snapshot, isRunning, isPaused, starting, start, stop, togglePause, reset,
+    feed, feedConnected, clearFeed, hits,
+    saved, save, unsave, exportSaved, claimStatuses, claim,
+    auth, isAuthed, connectOpen, setConnectOpen,
+  }), [
+    mode, setMode, params, setParams, validation, savedTemplates, applyTemplate, saveTemplate, deleteTemplate, lastRealMode,
+    rate, setRate, doubleCheck, setDoubleCheck, autoClaim, setAutoClaim,
+    sessionId, snapshot, isRunning, isPaused, starting, start, stop, togglePause, reset,
+    feed, feedConnected, clearFeed, hits, saved, save, unsave, exportSaved, claimStatuses, claim,
+    auth, isAuthed, connectOpen,
+  ]);
+
+  return <CheckerContext.Provider value={value}>{children}</CheckerContext.Provider>;
+}

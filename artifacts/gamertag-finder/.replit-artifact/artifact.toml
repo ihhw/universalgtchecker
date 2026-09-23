@@ -1,0 +1,27 @@
+kind = "web"
+previewPath = "/"
+title = "Xbox Gamertag Finder"
+version = "1.0.0"
+id = "artifacts/gamertag-finder"
+router = "path"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 25827
+
+[services.development]
+run = "pnpm --filter @workspace/gamertag-finder run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/gamertag-finder", "run", "build" ]
+serve = "static"
+publicDir = "artifacts/gamertag-finder/dist/public"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "25827"
+BASE_PATH = "/"

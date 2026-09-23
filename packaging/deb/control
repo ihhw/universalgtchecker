@@ -1,0 +1,12 @@
+Package: universal-checker
+Version: 1.0.0
+Section: web
+Priority: optional
+Architecture: all
+Depends: nodejs, python3, python3-gi, gir1.2-gtk-3.0, gir1.2-webkit2-4.1 | gir1.2-webkit2-4.0
+Maintainer: sjaf <noreply@example.invalid>
+Description: Xbox gamertag availability checker
+ Universal Checker is a black-and-gold desktop app for checking Xbox
+ gamertag availability, with an optional secondary policy check (Double
+ Check) before a result is treated as alertable, and an optional Discord
+ remote-control bot.

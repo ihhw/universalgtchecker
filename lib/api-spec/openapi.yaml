@@ -1,0 +1,266 @@
+openapi: 3.1.0
+info:
+  # Do not change the title, if the title changes, the import paths will be broken
+  title: Api
+  version: 0.1.0
+  description: Xbox Gamertag Finder API
+servers:
+  - url: /api
+    description: Base API path
+tags:
+  - name: health
+    description: Health operations
+  - name: gamertag
+    description: Gamertag search operations
+paths:
+  /healthz:
+    get:
+      operationId: healthCheck
+      tags: [health]
+      summary: Health check
+      description: Returns server health status
+      responses:
+        "200":
+          description: Healthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthStatus"
+
+  /gamertag/search:
+    post:
+      operationId: startGamertagSearch
+      tags: [gamertag]
+      summary: Start a gamertag search session
+      description: Creates a new search session and returns a sessionId. Connect to /gamertag/sessions/{sessionId}/stream (SSE) for live results.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GamertagSearchInput"
+      responses:
+        "201":
+          description: Session created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GamertagSession"
+        "400":
+          description: Invalid input
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+
+  /gamertag/sessions/{sessionId}:
+    get:
+      operationId: getGamertagSession
+      tags: [gamertag]
+      summary: Get session status and results
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Session details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GamertagSession"
+        "404":
+          description: Session not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+    delete:
+      operationId: cancelGamertagSession
+      tags: [gamertag]
+      summary: Cancel a running search session
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Session cancelled
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GamertagSession"
+        "404":
+          description: Session not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+
+  /gamertag/verify/{tag}:
+    get:
+      operationId: verifyGamertag
+      tags: [gamertag]
+      summary: Verify a specific gamertag's availability
+      description: Runs a fresh availability check on a single gamertag and returns the result with a confidence level. Use this to re-confirm tags found during a search before attempting to claim them.
+      parameters:
+        - name: tag
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Verification result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GamertagVerifyResult"
+        "400":
+          description: Invalid gamertag
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+
+  /gamertag/sessions/{sessionId}/stream:
+    get:
+      operationId: streamGamertagSession
+      tags: [gamertag]
+      summary: Stream live results via SSE
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: SSE stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
+
+components:
+  schemas:
+    HealthStatus:
+      type: object
+      properties:
+        status:
+          type: string
+      required:
+        - status
+
+    GenerationMode:
+      type: string
+      enum: ["random", "letters", "numbers", "mixed", "repetitive", "sequential", "alternating", "mirrored", "palindrome", "grouped", "block", "pattern", "combination", "prefix", "suffix", "prefix_suffix", "customizable", "position", "charset", "vowel_consonant", "word_number", "number_affix", "list"]
+      description: "Generation mode"
+
+    GenerationConfig:
+      type: object
+      required: [mode]
+      properties:
+        mode:
+          $ref: "#/components/schemas/GenerationMode"
+        params:
+          type: object
+          additionalProperties: true
+          description: "Settings for the selected mode. Validated server-side."
+
+    GamertagSearchInput:
+      type: object
+      required: [config, rate]
+      properties:
+        config:
+          $ref: "#/components/schemas/GenerationConfig"
+        rate:
+          type: number
+          minimum: 1
+          maximum: 1000
+          description: Checks per second
+        runEthanPolicyCheck:
+          type: boolean
+          description: "When true, run the Xbox reserve policy check (Double Check) on tags that pass the primary lookup"
+
+    GamertagResultStatus:
+      type: string
+      enum: ["available", "taken", "inappropriate", "seen", "unknown", "error"]
+
+    GamertagResult:
+      type: object
+      required: [gamertag, status]
+      properties:
+        gamertag:
+          type: string
+        status:
+          $ref: "#/components/schemas/GamertagResultStatus"
+        policy:
+          type: object
+          required: [status]
+          description: "Secondary Xbox policy check (Double Check) result"
+          properties:
+            status:
+              type: string
+              enum: ["approved", "banned", "unavailable", "rate_limited", "auth_required", "not_configured", "error"]
+            message:
+              type: string
+              description: "Explanation for a non-approved policy result"
+        alertable:
+          type: boolean
+          description: "True only when the final result may trigger an availability alert"
+
+    GamertagSession:
+      type: object
+      required: [sessionId, mode, label, rate, state, attempts, found, results]
+      properties:
+        sessionId:
+          type: string
+        mode:
+          $ref: "#/components/schemas/GenerationMode"
+        label:
+          type: string
+          description: "Short mode label shown in the live feed"
+        rate:
+          type: number
+        state:
+          type: string
+          enum: ["running", "completed", "cancelled"]
+        attempts:
+          type: number
+        found:
+          type: number
+        taken:
+          type: number
+        unknown:
+          type: number
+        paused:
+          type: boolean
+        results:
+          type: array
+          items:
+            $ref: "#/components/schemas/GamertagResult"
+
+    GamertagVerifyResult:
+      type: object
+      required: [gamertag, status, confidence]
+      properties:
+        gamertag:
+          type: string
+        status:
+          $ref: "#/components/schemas/GamertagResultStatus"
+        confidence:
+          type: string
+          enum: ["high", "medium", "low"]
+          description: "high = availability endpoint confirmed. medium = fallback used. low = inconclusive."
+
+    ApiError:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
