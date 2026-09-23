@@ -18,8 +18,11 @@ are added to the sidebar in `components/app-shell.tsx` as they are integrated.
   `GET /api/activity?only=hits`). The session snapshot (`GET /api/gamertag/sessions/:id`) is authoritative
   and is polled by the UI; SSE is only a realtime enhancement.
 - Claims: every claim (Hits button, Checker auto-claim, Sniper, Discord bot) goes through
-  `api-server/src/lib/xbox-claim.ts`: reserve (`POST gamertag.xboxlive.com/gamertags/reserve`) then change
-  (`POST gamertag.xboxlive.com/users/xuid({xuid})/gamertag`), authorized with the `http://xboxlive.com` XSTS token.
+  `api-server/src/lib/xbox-claim.ts`: reserve (`POST gamertag.xboxlive.com/gamertags/reserve`, confirmed
+  working against live Xbox) then change (`PUT accounts.xboxlive.com/users/current/profile/gamertag`,
+  `{ gamertag, previewOnly: false }`, contract version 3), authorized with the `http://xboxlive.com` XSTS
+  token. An earlier change endpoint under `gamertag.xboxlive.com/users/xuid({xuid})/gamertag` returned a
+  confirmed HTTP 404 against live Xbox — see `.agents/memory/gamertag-autoclaim.md`.
   A claim is `claimed` only when Xbox's response names the exact tag, or a freshly issued XSTS token reports it.
   One claim runs at a time. Checker auto-claim runs server-side and stops after the first confirmed claim.
   Recent claim records: `GET /api/gamertag/claims`.

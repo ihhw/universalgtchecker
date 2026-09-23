@@ -35,12 +35,9 @@ test("200: reserve + change, Xbox names the exact tag → CLAIMED (change_respon
   assert.match(String(res!.auth), /^XBL3\.0 x=uhs-1;xsts\|http:\/\/xboxlive\.com\|/, "claim uses the xboxlive.com XSTS token");
   assert.deepEqual(res!.body, { classicGamertag: "NewTag", reservationId: "2533274900000001", targetGamertagFields: "classicGamertag" });
   const [chg] = calls("change");
-  assert.equal(chg!.path, "/gamertag.xboxlive.com/users/xuid(2533274900000001)/gamertag");
-  assert.deepEqual(chg!.body, {
-    reservationId: "2533274900000001",
-    gamertag: { gamertag: "NewTag", gamertagSuffix: "", classicGamertag: "NewTag" },
-    preview: false, useLegacyEntitlement: false,
-  });
+  assert.equal(chg!.method, "PUT");
+  assert.equal(chg!.path, "/accounts.xboxlive.com/users/current/profile/gamertag");
+  assert.deepEqual(chg!.body, { gamertag: "NewTag", previewOnly: false });
   assert.ok(r.latency.totalMs !== null && r.latency.reserveMs !== null && r.latency.changeMs !== null);
   assert.equal(mock.state.gamertag, "NewTag");
 });

@@ -70,7 +70,7 @@ function classify(method: string, path: string): Endpoint | "unknown" {
   if (path.startsWith("/avatar-ssl.xboxlive.com/")) return "cdn";
   if (path.startsWith("/user.mgt.xboxlive.com/gamertags/reserve")) return "policy";
   if (path.startsWith("/gamertag.xboxlive.com/gamertags/reserve")) return "reserve";
-  if (/^\/gamertag\.xboxlive\.com\/users\/xuid\(\d+\)\/gamertag$/.test(path)) return "change";
+  if (path === "/accounts.xboxlive.com/users/current/profile/gamertag") return "change";
   return "unknown";
 }
 
@@ -200,14 +200,11 @@ export function startMockXbox(port = 0): Promise<{ url: string; state: MockState
         }
         case "change": {
           if (!xstsOk) { send(401, {}); return; }
-          const xuid = /xuid\((\d+)\)/.exec(path)?.[1];
-          const g = (b["gamertag"] ?? {}) as { classicGamertag?: string };
-          const gt = String(g.classicGamertag ?? "");
-          if (xuid !== state.xuid || b["reservationId"] !== state.xuid) { send(403, { description: "Not allowed" }); return; }
+          const gt = String(b["gamertag"] ?? "");
           if (state.reservations.get(gt.toUpperCase()) !== state.xuid) { send(409, { description: "No reservation" }); return; }
           state.gamertag = gt;
           state.taken.add(gt.toUpperCase());
-          send(200, { classicGamertag: gt, gamertag: gt, gamertagSuffix: "" });
+          send(200, { gamertag: gt, gamertagSuffix: "" });
           return;
         }
         default:

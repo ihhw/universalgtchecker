@@ -7,9 +7,9 @@
  *   1. POST gamertag.xboxlive.com/gamertags/reserve
  *        { classicGamertag, reservationId: <xuid>, targetGamertagFields: "classicGamertag" }
  *      Reserves the exact name for this account. 409 = taken/reserved elsewhere.
- *   2. POST gamertag.xboxlive.com/users/xuid(<xuid>)/gamertag
- *        { reservationId: <xuid>, gamertag: { gamertag, gamertagSuffix: "", classicGamertag },
- *          preview: false, useLegacyEntitlement: false }
+ *      CONFIRMED against live Xbox: this call succeeds (accepts the reservation).
+ *   2. PUT accounts.xboxlive.com/users/current/profile/gamertag
+ *        { gamertag, previewOnly: false }, x-xbl-contract-version: 3
  *      Performs the change using that reservation.
  *
  * A result is CLAIMED only when Xbox confirms it: either the change response
@@ -18,9 +18,13 @@
  * reports the requested gamertag for this account. Sending a request is never
  * treated as success.
  *
- * NOTE: these are the endpoints Xbox's own web gamertag-change flow uses; they
- * are not officially documented by Microsoft and may change. They could not be
- * exercised against live Xbox from the development environment.
+ * NOTE: these are the endpoints Xbox's own apps use for gamertag changes, per
+ * reverse-engineered Xbox Live traffic; they are not officially documented by
+ * Microsoft and may change. An earlier version of this file guessed a change
+ * URL under gamertag.xboxlive.com that returned HTTP 404 against live Xbox —
+ * see .agents/memory/gamertag-autoclaim.md for that history. The endpoint
+ * above has NOT yet been confirmed against live Xbox either; the next real
+ * claim attempt is the actual test.
  */
 
 import { logger } from "./logger";
@@ -31,7 +35,12 @@ import { getWebhookTarget, sendWebhookPayload } from "./webhook-store";
 
 const GAMERTAG_HOST = "https://gamertag.xboxlive.com";
 const RESERVE_URL   = `${GAMERTAG_HOST}/gamertags/reserve`;
-const changeUrl = (xuid: string) => `${GAMERTAG_HOST}/users/xuid(${xuid})/gamertag`;
+// Confirmed against live Xbox: gamertag.xboxlive.com/users/xuid(<xuid>)/gamertag
+// does not exist (HTTP 404). This is the endpoint Xbox's own apps use for the
+// change step, per reverse-engineered Xbox Live traffic (OpenXbox xbox-webapi
+// and related community write-ups). Still unverified against live Xbox as of
+// this change — the next real attempt is the actual test.
+const CHANGE_URL = "https://accounts.xboxlive.com/users/current/profile/gamertag";
 // Overridable only so tests can exercise timeouts quickly.
 const RESERVE_TIMEOUT_MS = Number(process.env["XBOX_RESERVE_TIMEOUT_MS"]) || 10_000;
 const CHANGE_TIMEOUT_MS  = Number(process.env["XBOX_CHANGE_TIMEOUT_MS"]) || 15_000;
@@ -155,16 +164,19 @@ function errorKind(err: unknown): "timeout" | "network" {
   return name === "TimeoutError" || name === "AbortError" ? "timeout" : "network";
 }
 
-async function send(url: string, authHeader: string, body: unknown, timeoutMs: number) {
+async function send(
+  url: string, authHeader: string, body: unknown, timeoutMs: number,
+  opts: { method?: string; contractVersion?: string } = {},
+) {
   const res = await fastFetch(url, {
-    method: "POST",
+    method: opts.method ?? "POST",
     signal: AbortSignal.timeout(timeoutMs),
     headers: {
       Authorization:            authHeader,
       "Content-Type":           "application/json",
       Accept:                   "application/json",
       "Accept-Language":        "en-US",
-      "x-xbl-contract-version": "1",
+      "x-xbl-contract-version": opts.contractVersion ?? "1",
     },
     body: JSON.stringify(body),
   });
@@ -326,12 +338,10 @@ export async function claimGamertag(
     const tChange = now();
     let change;
     try {
-      change = await send(changeUrl(ctx.xuid), ctx.authHeader, {
-        reservationId: ctx.xuid,
-        gamertag: { gamertag, gamertagSuffix: "", classicGamertag: gamertag },
-        preview: false,
-        useLegacyEntitlement: false,
-      }, CHANGE_TIMEOUT_MS);
+      change = await send(CHANGE_URL, ctx.authHeader, {
+        gamertag,
+        previewOnly: false,
+      }, CHANGE_TIMEOUT_MS, { method: "PUT", contractVersion: "3" });
     } catch (err) {
       record.latency.changeMs = ms(tChange);
       // The request may or may not have been applied; ask Xbox.
