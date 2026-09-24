@@ -48,6 +48,7 @@ export type GenerationConfigParams = { [key: string]: unknown };
 
 export interface GenerationConfig {
   mode: GenerationMode;
+  /** Settings for the selected mode. Validated server-side. */
   params?: GenerationConfigParams;
 }
 
@@ -77,9 +78,6 @@ export const GamertagResultStatus = {
   error: 'error',
 } as const;
 
-/**
- * Secondary Xbox policy check status
- */
 export type GamertagResultPolicyStatus = typeof GamertagResultPolicyStatus[keyof typeof GamertagResultPolicyStatus];
 
 
@@ -105,6 +103,7 @@ export type GamertagResultPolicy = {
 export interface GamertagResult {
   gamertag: string;
   status: GamertagResultStatus;
+  /** Secondary Xbox policy check (Double Check) result */
   policy?: GamertagResultPolicy;
   /** True only when the final result may trigger an availability alert */
   alertable?: boolean;
@@ -155,5 +154,101 @@ export interface GamertagVerifyResult {
 
 export interface ApiError {
   error: string;
+}
+
+/**
+ * Discord generation mode
+ */
+export type DiscordGenerationMode = typeof DiscordGenerationMode[keyof typeof DiscordGenerationMode];
+
+
+export const DiscordGenerationMode = {
+  random: 'random',
+  letters: 'letters',
+  numbers: 'numbers',
+  mixed: 'mixed',
+  repetitive: 'repetitive',
+  sequential: 'sequential',
+  alternating: 'alternating',
+  pattern: 'pattern',
+  symbol: 'symbol',
+  word: 'word',
+  word_pair: 'word_pair',
+  word_num_word: 'word_num_word',
+  list: 'list',
+} as const;
+
+/**
+ * Settings for the selected mode. Validated server-side.
+ */
+export type DiscordGenerationConfigParams = { [key: string]: unknown };
+
+export interface DiscordGenerationConfig {
+  mode: DiscordGenerationMode;
+  /** Settings for the selected mode. Validated server-side. */
+  params?: DiscordGenerationConfigParams;
+}
+
+export interface DiscordSearchInput {
+  config: DiscordGenerationConfig;
+  /**
+     * Checks per second
+     * @minimum 1
+     * @maximum 50
+     */
+  rate: number;
+}
+
+export type DiscordResultStatus = typeof DiscordResultStatus[keyof typeof DiscordResultStatus];
+
+
+export const DiscordResultStatus = {
+  available: 'available',
+  taken: 'taken',
+  unknown: 'unknown',
+  error: 'error',
+} as const;
+
+export interface DiscordResult {
+  username: string;
+  status: DiscordResultStatus;
+}
+
+export type DiscordSessionState = typeof DiscordSessionState[keyof typeof DiscordSessionState];
+
+
+export const DiscordSessionState = {
+  running: 'running',
+  completed: 'completed',
+  cancelled: 'cancelled',
+} as const;
+
+export interface DiscordSession {
+  sessionId: string;
+  mode: DiscordGenerationMode;
+  /** Short mode label shown in the live feed */
+  label: string;
+  rate: number;
+  state: DiscordSessionState;
+  attempts: number;
+  found: number;
+  taken?: number;
+  unknown?: number;
+  paused?: boolean;
+  results: DiscordResult[];
+}
+
+export type DiscordVerifyResultConfidence = typeof DiscordVerifyResultConfidence[keyof typeof DiscordVerifyResultConfidence];
+
+
+export const DiscordVerifyResultConfidence = {
+  high: 'high',
+  low: 'low',
+} as const;
+
+export interface DiscordVerifyResult {
+  username: string;
+  status: DiscordResultStatus;
+  confidence: DiscordVerifyResultConfidence;
 }
 

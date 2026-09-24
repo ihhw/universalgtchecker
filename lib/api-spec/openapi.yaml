@@ -12,6 +12,8 @@ tags:
     description: Health operations
   - name: gamertag
     description: Gamertag search operations
+  - name: discord
+    description: Discord username search operations
 paths:
   /healthz:
     get:
@@ -131,6 +133,125 @@ paths:
     get:
       operationId: streamGamertagSession
       tags: [gamertag]
+      summary: Stream live results via SSE
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: SSE stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
+
+  /discord/search:
+    post:
+      operationId: startDiscordSearch
+      tags: [discord]
+      summary: Start a Discord username search session
+      description: Creates a new search session and returns a sessionId. Connect to /discord/sessions/{sessionId}/stream (SSE) for live results.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DiscordSearchInput"
+      responses:
+        "201":
+          description: Session created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DiscordSession"
+        "400":
+          description: Invalid input
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+
+  /discord/sessions/{sessionId}:
+    get:
+      operationId: getDiscordSession
+      tags: [discord]
+      summary: Get session status and results
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Session details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DiscordSession"
+        "404":
+          description: Session not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+    delete:
+      operationId: cancelDiscordSession
+      tags: [discord]
+      summary: Cancel a running search session
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Session cancelled
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DiscordSession"
+        "404":
+          description: Session not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+
+  /discord/verify/{username}:
+    get:
+      operationId: verifyDiscordUsername
+      tags: [discord]
+      summary: Verify a specific Discord username's availability
+      description: Runs a fresh availability check on a single username and returns the result with a confidence level.
+      parameters:
+        - name: username
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Verification result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DiscordVerifyResult"
+        "400":
+          description: Invalid username
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+
+  /discord/sessions/{sessionId}/stream:
+    get:
+      operationId: streamDiscordSession
+      tags: [discord]
       summary: Stream live results via SSE
       parameters:
         - name: sessionId
@@ -267,3 +388,87 @@ components:
       properties:
         error:
           type: string
+
+    DiscordGenerationMode:
+      type: string
+      enum: ["random", "letters", "numbers", "mixed", "repetitive", "sequential", "alternating", "pattern", "symbol", "word", "word_pair", "word_num_word", "list"]
+      description: "Discord generation mode"
+
+    DiscordGenerationConfig:
+      type: object
+      required: [mode]
+      properties:
+        mode:
+          $ref: "#/components/schemas/DiscordGenerationMode"
+        params:
+          type: object
+          additionalProperties: true
+          description: "Settings for the selected mode. Validated server-side."
+
+    DiscordSearchInput:
+      type: object
+      required: [config, rate]
+      properties:
+        config:
+          $ref: "#/components/schemas/DiscordGenerationConfig"
+        rate:
+          type: number
+          minimum: 1
+          maximum: 50
+          description: Checks per second
+
+    DiscordResultStatus:
+      type: string
+      enum: ["available", "taken", "unknown", "error"]
+
+    DiscordResult:
+      type: object
+      required: [username, status]
+      properties:
+        username:
+          type: string
+        status:
+          $ref: "#/components/schemas/DiscordResultStatus"
+
+    DiscordSession:
+      type: object
+      required: [sessionId, mode, label, rate, state, attempts, found, results]
+      properties:
+        sessionId:
+          type: string
+        mode:
+          $ref: "#/components/schemas/DiscordGenerationMode"
+        label:
+          type: string
+          description: "Short mode label shown in the live feed"
+        rate:
+          type: number
+        state:
+          type: string
+          enum: ["running", "completed", "cancelled"]
+        attempts:
+          type: number
+        found:
+          type: number
+        taken:
+          type: number
+        unknown:
+          type: number
+        paused:
+          type: boolean
+        results:
+          type: array
+          items:
+            $ref: "#/components/schemas/DiscordResult"
+
+    DiscordVerifyResult:
+      type: object
+      required: [username, status, confidence]
+      properties:
+        username:
+          type: string
+        status:
+          $ref: "#/components/schemas/DiscordResultStatus"
+        confidence:
+          type: string
+          enum: ["high", "low"]

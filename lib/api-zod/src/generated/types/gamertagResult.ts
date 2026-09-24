@@ -11,6 +11,7 @@ import type { GamertagResultStatus } from './gamertagResultStatus';
 export interface GamertagResult {
   gamertag: string;
   status: GamertagResultStatus;
+  /** Secondary Xbox policy check (Double Check) result */
   policy?: GamertagResultPolicy;
   /** True only when the final result may trigger an availability alert */
   alertable?: boolean;

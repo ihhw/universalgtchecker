@@ -53,7 +53,7 @@ export const StartGamertagSearchResponse = zod.object({
   "status": zod.enum(['approved', 'banned', 'unavailable', 'rate_limited', 'auth_required', 'not_configured', 'error']),
   "message": zod.string().optional().describe('Explanation for a non-approved policy result')
 }).optional().describe('Secondary Xbox policy check (Double Check) result'),
-  "alertable": zod.boolean().optional().describe('True only when the final result may trigger an availability alert (primary available, and secondary policy approved when double check is enabled)')
+  "alertable": zod.boolean().optional().describe('True only when the final result may trigger an availability alert')
 }))
 })
 
@@ -83,7 +83,7 @@ export const GetGamertagSessionResponse = zod.object({
   "status": zod.enum(['approved', 'banned', 'unavailable', 'rate_limited', 'auth_required', 'not_configured', 'error']),
   "message": zod.string().optional().describe('Explanation for a non-approved policy result')
 }).optional().describe('Secondary Xbox policy check (Double Check) result'),
-  "alertable": zod.boolean().optional().describe('True only when the final result may trigger an availability alert (primary available, and secondary policy approved when double check is enabled)')
+  "alertable": zod.boolean().optional().describe('True only when the final result may trigger an availability alert')
 }))
 })
 
@@ -113,7 +113,7 @@ export const CancelGamertagSessionResponse = zod.object({
   "status": zod.enum(['approved', 'banned', 'unavailable', 'rate_limited', 'auth_required', 'not_configured', 'error']),
   "message": zod.string().optional().describe('Explanation for a non-approved policy result')
 }).optional().describe('Secondary Xbox policy check (Double Check) result'),
-  "alertable": zod.boolean().optional().describe('True only when the final result may trigger an availability alert (primary available, and secondary policy approved when double check is enabled)')
+  "alertable": zod.boolean().optional().describe('True only when the final result may trigger an availability alert')
 }))
 })
 
@@ -141,5 +141,114 @@ export const StreamGamertagSessionParams = zod.object({
 })
 
 export const StreamGamertagSessionResponse = zod.unknown()
+
+
+/**
+ * Creates a new search session and returns a sessionId. Connect to /discord/sessions/{sessionId}/stream (SSE) for live results.
+ * @summary Start a Discord username search session
+ */
+export const startDiscordSearchBodyRateMax = 50;
+
+
+
+export const StartDiscordSearchBody = zod.object({
+  "config": zod.object({
+  "mode": zod.enum(['random', 'letters', 'numbers', 'mixed', 'repetitive', 'sequential', 'alternating', 'pattern', 'symbol', 'word', 'word_pair', 'word_num_word', 'list']).describe('Discord generation mode'),
+  "params": zod.record(zod.string(), zod.unknown()).optional().describe('Settings for the selected mode. Validated server-side.')
+}),
+  "rate": zod.number().min(1).max(startDiscordSearchBodyRateMax).describe('Checks per second')
+})
+
+export const StartDiscordSearchResponse = zod.object({
+  "sessionId": zod.string(),
+  "mode": zod.enum(['random', 'letters', 'numbers', 'mixed', 'repetitive', 'sequential', 'alternating', 'pattern', 'symbol', 'word', 'word_pair', 'word_num_word', 'list']).describe('Discord generation mode'),
+  "label": zod.string().describe('Short mode label shown in the live feed'),
+  "rate": zod.number(),
+  "state": zod.enum(['running', 'completed', 'cancelled']),
+  "attempts": zod.number(),
+  "found": zod.number(),
+  "taken": zod.number().optional(),
+  "unknown": zod.number().optional(),
+  "paused": zod.boolean().optional(),
+  "results": zod.array(zod.object({
+  "username": zod.string(),
+  "status": zod.enum(['available', 'taken', 'unknown', 'error'])
+}))
+})
+
+
+/**
+ * @summary Get session status and results
+ */
+export const GetDiscordSessionParams = zod.object({
+  "sessionId": zod.coerce.string()
+})
+
+export const GetDiscordSessionResponse = zod.object({
+  "sessionId": zod.string(),
+  "mode": zod.enum(['random', 'letters', 'numbers', 'mixed', 'repetitive', 'sequential', 'alternating', 'pattern', 'symbol', 'word', 'word_pair', 'word_num_word', 'list']).describe('Discord generation mode'),
+  "label": zod.string().describe('Short mode label shown in the live feed'),
+  "rate": zod.number(),
+  "state": zod.enum(['running', 'completed', 'cancelled']),
+  "attempts": zod.number(),
+  "found": zod.number(),
+  "taken": zod.number().optional(),
+  "unknown": zod.number().optional(),
+  "paused": zod.boolean().optional(),
+  "results": zod.array(zod.object({
+  "username": zod.string(),
+  "status": zod.enum(['available', 'taken', 'unknown', 'error'])
+}))
+})
+
+
+/**
+ * @summary Cancel a running search session
+ */
+export const CancelDiscordSessionParams = zod.object({
+  "sessionId": zod.coerce.string()
+})
+
+export const CancelDiscordSessionResponse = zod.object({
+  "sessionId": zod.string(),
+  "mode": zod.enum(['random', 'letters', 'numbers', 'mixed', 'repetitive', 'sequential', 'alternating', 'pattern', 'symbol', 'word', 'word_pair', 'word_num_word', 'list']).describe('Discord generation mode'),
+  "label": zod.string().describe('Short mode label shown in the live feed'),
+  "rate": zod.number(),
+  "state": zod.enum(['running', 'completed', 'cancelled']),
+  "attempts": zod.number(),
+  "found": zod.number(),
+  "taken": zod.number().optional(),
+  "unknown": zod.number().optional(),
+  "paused": zod.boolean().optional(),
+  "results": zod.array(zod.object({
+  "username": zod.string(),
+  "status": zod.enum(['available', 'taken', 'unknown', 'error'])
+}))
+})
+
+
+/**
+ * Runs a fresh availability check on a single username and returns the result with a confidence level.
+ * @summary Verify a specific Discord username's availability
+ */
+export const VerifyDiscordUsernameParams = zod.object({
+  "username": zod.coerce.string()
+})
+
+export const VerifyDiscordUsernameResponse = zod.object({
+  "username": zod.string(),
+  "status": zod.enum(['available', 'taken', 'unknown', 'error']),
+  "confidence": zod.enum(['high', 'low'])
+})
+
+
+/**
+ * @summary Stream live results via SSE
+ */
+export const StreamDiscordSessionParams = zod.object({
+  "sessionId": zod.coerce.string()
+})
+
+export const StreamDiscordSessionResponse = zod.unknown()
 
 

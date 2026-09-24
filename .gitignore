@@ -57,6 +57,8 @@ Thumbs.db
 # Runtime-generated files from the API server
 artifacts/api-server/results.txt
 artifacts/api-server/state.json
+artifacts/api-server/discord-results.txt
+artifacts/api-server/discord-state.json
 artifacts/discord-bot/search_state.json
 
 artifacts/api-server/webhook.json

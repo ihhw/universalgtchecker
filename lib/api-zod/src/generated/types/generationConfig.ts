@@ -10,5 +10,6 @@ import type { GenerationMode } from './generationMode';
 
 export interface GenerationConfig {
   mode: GenerationMode;
+  /** Settings for the selected mode. Validated server-side. */
   params?: GenerationConfigParams;
 }

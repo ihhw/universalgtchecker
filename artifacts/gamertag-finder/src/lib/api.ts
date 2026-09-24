@@ -3,7 +3,7 @@ export const BASE = import.meta.env.BASE_URL.replace(/\/$/, "");
 /** Absolute-path helper for calls to the Express API (works under any base path). */
 export const api = (path: string): string => `${BASE}/api${path}`;
 
-export type Platform = "xbox";
+export type Platform = "xbox" | "discord";
 export type FeedStatus = "available" | "taken" | "unknown";
 
 /** Shape of an event emitted by the backend activity log. */
@@ -24,6 +24,7 @@ export interface ActivityEvent {
 
 export const PLATFORM_LABEL: Record<Platform, string> = {
   xbox: "Xbox",
+  discord: "Discord",
 };
 
 export function formatClock(ts: number): string {

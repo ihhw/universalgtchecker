@@ -13,13 +13,16 @@ const smallBtn =
 // ── mode picker ──────────────────────────────────────────────────────────────
 
 export function ModePicker({
-  mode, onSelect, disabled,
-}: { mode: string; onSelect: (id: string) => void; disabled?: boolean }) {
-  const active: CategoryId = (MODES.find((m) => m.id === mode)?.category) ?? "basic";
+  mode, onSelect, disabled, modes = MODES, categories = CATEGORIES,
+}: {
+  mode: string; onSelect: (id: string) => void; disabled?: boolean;
+  modes?: ModeDef[]; categories?: { id: CategoryId; label: string }[];
+}) {
+  const active: CategoryId = (modes.find((m) => m.id === mode)?.category) ?? categories[0]!.id;
   return (
     <div>
       <div role="tablist" aria-label="Mode category" className="flex gap-1 rounded-lg border border-border bg-[hsl(var(--well))] p-1">
-        {CATEGORIES.map((c) => (
+        {categories.map((c) => (
           <button
             key={c.id}
             type="button"
@@ -27,7 +30,7 @@ export function ModePicker({
             aria-selected={active === c.id}
             disabled={disabled}
             onClick={() => {
-              if (active !== c.id) onSelect(MODES.find((m) => m.category === c.id)!.id);
+              if (active !== c.id) onSelect(modes.find((m) => m.category === c.id)!.id);
             }}
             className={cn(
               "flex-1 rounded-md px-3 py-1.5 text-[13px] transition-colors disabled:cursor-not-allowed",
@@ -40,7 +43,7 @@ export function ModePicker({
       </div>
 
       <div role="radiogroup" aria-label="Mode" className="mt-3 flex flex-wrap gap-2">
-        {MODES.filter((m) => m.category === active).map((m) => {
+        {modes.filter((m) => m.category === active).map((m) => {
           const on = m.id === mode;
           return (
             <button
@@ -204,8 +207,11 @@ function LinesField({
 }
 
 function FieldControl({
-  field, params, set, disabled,
-}: { field: Field; params: Params; set: (patch: Params) => void; disabled?: boolean }) {
+  field, params, set, disabled, lengthMin = 3, lengthMax = 15,
+}: {
+  field: Field; params: Params; set: (patch: Params) => void; disabled?: boolean;
+  lengthMin?: number; lengthMax?: number;
+}) {
   const v = params[field.key];
   switch (field.kind) {
     case "range": {
@@ -214,7 +220,7 @@ function FieldControl({
       return (
         <div className="flex items-center gap-2">
           <input
-            type="number" min={3} max={15} aria-label="Minimum length" disabled={disabled}
+            type="number" min={lengthMin} max={lengthMax} aria-label="Minimum length" disabled={disabled}
             value={asString(min)} className={cn(inputCls, "w-20")}
             onChange={(e) => {
               const n = toNumberOrBlank(e.target.value);
@@ -224,7 +230,7 @@ function FieldControl({
           />
           <span className="text-xs text-muted-foreground">to</span>
           <input
-            type="number" min={3} max={15} aria-label="Maximum length" disabled={disabled}
+            type="number" min={lengthMin} max={lengthMax} aria-label="Maximum length" disabled={disabled}
             value={asString(max)} className={cn(inputCls, "w-20")}
             onChange={(e) => set({ maxLength: toNumberOrBlank(e.target.value) })}
           />
@@ -290,8 +296,11 @@ const isWide = (f: Field): boolean =>
 
 /** Settings for the selected mode only. Nothing else is shown. */
 export function ModeForm({
-  mode, params, onChange, disabled,
-}: { mode: ModeDef; params: Params; onChange: (patch: Params) => void; disabled?: boolean }) {
+  mode, params, onChange, disabled, lengthMin, lengthMax,
+}: {
+  mode: ModeDef; params: Params; onChange: (patch: Params) => void; disabled?: boolean;
+  lengthMin?: number; lengthMax?: number;
+}) {
   const fields = mode.fields.filter((f) => !f.when || f.when(params));
   if (fields.length === 0 && !mode.note) return null;
   return (
@@ -305,11 +314,11 @@ export function ModeForm({
                 <p className="text-[13px] font-medium">{f.label}</p>
                 {f.hint && <p className="mt-0.5 text-xs text-muted-foreground">{f.hint}</p>}
               </div>
-              <FieldControl field={f} params={params} set={onChange} disabled={disabled} />
+              <FieldControl field={f} params={params} set={onChange} disabled={disabled} lengthMin={lengthMin} lengthMax={lengthMax} />
             </div>
           ) : (
             <Shell key={f.key} label={f.label} hint={f.hint} wide={isWide(f)}>
-              <FieldControl field={f} params={params} set={onChange} disabled={disabled} />
+              <FieldControl field={f} params={params} set={onChange} disabled={disabled} lengthMin={lengthMin} lengthMax={lengthMax} />
             </Shell>
           ),
         )}

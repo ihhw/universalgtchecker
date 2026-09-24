@@ -4,6 +4,7 @@ import { sniperStats } from "../lib/xbox-sniper";
 import { activityClientCount } from "../lib/activity";
 import { getBotStatus } from "../lib/bot-status";
 import { getSessionStats } from "./gamertag";
+import { getDiscordSessionStats } from "./discord";
 
 const router: IRouter = Router();
 
@@ -40,6 +41,27 @@ async function probeXboxCdn(): Promise<{ state: ServiceState; detail: string }> 
   return result;
 }
 
+let discordCache: { at: number; state: ServiceState; detail: string } | null = null;
+
+async function probeDiscordApi(): Promise<{ state: ServiceState; detail: string }> {
+  if (discordCache && Date.now() - discordCache.at < CDN_TTL_MS) return discordCache;
+  let result: { state: ServiceState; detail: string };
+  try {
+    const started = Date.now();
+    await fetch("https://discord.com/api/v9/unique-username/username-attempt-unauthed", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ username: "statusprobe" }),
+      signal: AbortSignal.timeout(4_000),
+    });
+    result = { state: "online", detail: `Reachable, ${Date.now() - started} ms` };
+  } catch {
+    result = { state: "offline", detail: "Unreachable from the server" };
+  }
+  discordCache = { at: Date.now(), ...result };
+  return result;
+}
+
 function formatUptime(seconds: number): string {
   const s = Math.round(seconds);
   if (s < 60) return `${s} s`;
@@ -49,9 +71,12 @@ function formatUptime(seconds: number): string {
 
 /** GET /api/status — verified state of each service; UNKNOWN when unverifiable. */
 router.get("/status", async (_req, res): Promise<void> => {
-  const cdn = await probeXboxCdn();
+  const [cdn, discordProbe] = await Promise.all([probeXboxCdn(), probeDiscordApi()]);
   const authed = isAuthenticated();
   const stats = getSessionStats();
+  const discordStats = getDiscordSessionStats();
+  const runningTotal = stats.running + discordStats.running;
+  const sseTotal = stats.sseClients + discordStats.sseClients + activityClientCount();
 
   let xbox: ServiceStatus;
   if (cdn.state === "offline") {
@@ -69,16 +94,22 @@ router.get("/status", async (_req, res): Promise<void> => {
     { id: "api", label: "API", state: "online", detail: `Up ${formatUptime(process.uptime())}` },
     xbox,
     {
+      id: "discord-api",
+      label: "Discord API",
+      state: discordProbe.state,
+      detail: discordProbe.detail,
+    },
+    {
       id: "engine",
       label: "Checker engine",
       state: "online",
-      detail: `${stats.running} search${stats.running === 1 ? "" : "es"} running${sniperStats().running ? " · sniper watching" : ""}`,
+      detail: `${runningTotal} search${runningTotal === 1 ? "" : "es"} running${sniperStats().running ? " · sniper watching" : ""}`,
     },
     {
       id: "realtime",
       label: "Realtime",
       state: "online",
-      detail: `${stats.sseClients + activityClientCount()} stream${stats.sseClients + activityClientCount() === 1 ? "" : "s"} connected`,
+      detail: `${sseTotal} stream${sseTotal === 1 ? "" : "s"} connected`,
     },
     { id: "bot", label: "Discord bot", ...getBotStatus() },
   ];

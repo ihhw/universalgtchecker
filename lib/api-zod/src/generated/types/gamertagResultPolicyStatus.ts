@@ -6,9 +6,6 @@
  * OpenAPI spec version: 0.1.0
  */
 
-/**
- * Optional secondary Xbox policy result
- */
 export type GamertagResultPolicyStatus = typeof GamertagResultPolicyStatus[keyof typeof GamertagResultPolicyStatus];
 
 

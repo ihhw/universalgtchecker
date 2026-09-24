@@ -1,12 +1,17 @@
 # Universal Checker (by sjaf)
 
 A unified username/gamertag checking dashboard. Xbox is the first tool (formerly GTagHunter):
-high-speed gamertag availability checks with Double Check and auto-claim. A Discord bot (`artifacts/discord-bot`) remains as a remote control. New platform checkers
-are added to the sidebar in `components/app-shell.tsx` as they are integrated.
+high-speed gamertag availability checks with Double Check and auto-claim. Discord username
+checking is the second platform: high-speed availability checks against Discord's public
+unique-username endpoint, alerting only — there is no claim flow, since claiming a Discord
+username programmatically requires a real user's session token, which would be self-bot
+automation against Discord's Terms of Service. A Discord bot (`artifacts/discord-bot`) remains
+as a remote control for the Xbox checker. New platform checkers are added to the sidebar in
+`components/app-shell.tsx` as they are integrated.
 
 ## App map
 
-- Routes: `/xbox` (Checker), `/xbox/sniper` (Sniper), `/hits`, `/activity` (live activity), `/status` (system status), `/settings`
+- Routes: `/xbox` (Checker), `/xbox/sniper` (Sniper), `/discord` (Checker), `/hits`, `/activity` (live activity), `/status` (system status), `/settings`
 - Theme: black + gold (tokens in `artifacts/gamertag-finder/src/index.css`); logo in `public/logo*.svg`, `favicon.svg`, and `src/components/logo.tsx`
 - Generation: a mode system (Basic, Pattern, Advanced, Input) in `lib/modes.ts` (UI) and `api-server/src/lib/gamertag-generator.ts` (engine). Xbox rules live in one place, `api-server/src/lib/xbox-validation.ts`: 3-15 characters, first character a letter, letters/numbers/single inner spaces only.
 - A result is `available` + `alertable` only when the primary check says available and, with
@@ -14,6 +19,14 @@ are added to the sidebar in `components/app-shell.tsx` as they are integrated.
   reach the Discord webhook, auto-claim or the Discord bot. Policy failures become `unknown`.
 - Discord webhook is configured in Settings and stored server-side (`artifacts/api-server/webhook.json`,
   git-ignored, never returned to the browser). `DISCORD_WEBHOOK_URL` is still honoured as a fallback.
+  The same webhook is used for both Xbox and Discord username hits.
+- Discord checker: generation engine in `api-server/src/lib/discord-generator.ts` (UI catalog in
+  `lib/discord-modes.ts`), rules in `api-server/src/lib/discord-validation.ts` (2-32 characters,
+  lowercase a-z/0-9/_/., no leading/trailing period, no double period), availability checks in
+  `api-server/src/lib/discord-availability.ts` against Discord's unauthenticated
+  `/api/v9/unique-username/username-attempt-unauthed`. No proxy pool backs this endpoint here (a
+  single server egress IP), so its rate is capped far below the Xbox checker's (1-50/s vs 1-1000/s)
+  and a process-wide circuit breaker backs off together on repeated 429s.
 - Live activity is a bounded in-memory log of real checks (`GET /api/activity`, SSE `/api/activity/stream`,
   `GET /api/activity?only=hits`). The session snapshot (`GET /api/gamertag/sessions/:id`) is authoritative
   and is polled by the UI; SSE is only a realtime enhancement.

@@ -9,7 +9,7 @@ import { recordCheck } from "./stats";
  * cannot grow memory without bound.
  */
 
-export type ActivityPlatform = "xbox";
+export type ActivityPlatform = "xbox" | "discord";
 export type ActivityStatus = "available" | "taken" | "unknown";
 
 export interface ActivityEvent {

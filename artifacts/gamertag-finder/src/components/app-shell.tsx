@@ -17,6 +17,12 @@ const PLATFORMS: NavGroup[] = [
       { label: "Sniper", href: "/xbox/sniper" },
     ],
   },
+  {
+    label: "Discord",
+    items: [
+      { label: "Checker", href: "/discord" },
+    ],
+  },
 ];
 
 const WORKSPACE: NavItem[] = [

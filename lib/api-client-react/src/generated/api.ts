@@ -21,6 +21,9 @@ import type {
 
 import type {
   ApiError,
+  DiscordSearchInput,
+  DiscordSession,
+  DiscordVerifyResult,
   GamertagSearchInput,
   GamertagSession,
   GamertagVerifyResult,
@@ -495,6 +498,381 @@ export function useStreamGamertagSession<TData = Awaited<ReturnType<typeof strea
  ):  UseQueryResult<TData, TError> & { queryKey: QueryKey } {
 
   const queryOptions = getStreamGamertagSessionQueryOptions(sessionId,options)
+
+  const query = useQuery(queryOptions) as  UseQueryResult<TData, TError> & { queryKey: QueryKey };
+
+  return withQueryKey(query, queryOptions.queryKey);
+}
+
+
+
+
+
+
+
+export const getStartDiscordSearchUrl = () => {
+
+
+
+
+  return `/api/discord/search`
+}
+
+/**
+ * Creates a new search session and returns a sessionId. Connect to /discord/sessions/{sessionId}/stream (SSE) for live results.
+ * @summary Start a Discord username search session
+ */
+export const startDiscordSearch = async (discordSearchInput: DiscordSearchInput, options?: Parameters<typeof customFetch>[1]): Promise<DiscordSession> => {
+
+  return customFetch<DiscordSession>(getStartDiscordSearchUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(discordSearchInput)
+  }
+);}
+
+
+
+
+
+export const getStartDiscordSearchMutationOptions = <TError = ErrorType<ApiError>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof startDiscordSearch>>, TError,{data: BodyType<DiscordSearchInput>}, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof startDiscordSearch>>, TError,{data: BodyType<DiscordSearchInput>}, TContext> => {
+
+const mutationKey = ['startDiscordSearch'];
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof startDiscordSearch>>, {data: BodyType<DiscordSearchInput>}> = (props) => {
+          const {data} = props ?? {};
+
+          return  startDiscordSearch(data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type StartDiscordSearchMutationResult = NonNullable<Awaited<ReturnType<typeof startDiscordSearch>>>
+    export type StartDiscordSearchMutationBody = BodyType<DiscordSearchInput>
+    export type StartDiscordSearchMutationError = ErrorType<ApiError>
+
+    /**
+ * @summary Start a Discord username search session
+ */
+export const useStartDiscordSearch = <TError = ErrorType<ApiError>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof startDiscordSearch>>, TError,{data: BodyType<DiscordSearchInput>}, TContext>, request?: SecondParameter<typeof customFetch>}
+ ): UseMutationResult<
+        Awaited<ReturnType<typeof startDiscordSearch>>,
+        TError,
+        {data: BodyType<DiscordSearchInput>},
+        TContext
+      > => {
+      return useMutation(getStartDiscordSearchMutationOptions(options));
+    }
+
+export const getGetDiscordSessionUrl = (sessionId: string,) => {
+
+
+
+
+  return `/api/discord/sessions/${sessionId}`
+}
+
+/**
+ * @summary Get session status and results
+ */
+export const getDiscordSession = async (sessionId: string, options?: Parameters<typeof customFetch>[1]): Promise<DiscordSession> => {
+
+  return customFetch<DiscordSession>(getGetDiscordSessionUrl(sessionId),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getGetDiscordSessionQueryKey = (sessionId: string,) => {
+    return [
+    `/api/discord/sessions/${sessionId}`
+    ] as const;
+    }
+
+
+export const getGetDiscordSessionQueryOptions = <TData = Awaited<ReturnType<typeof getDiscordSession>>, TError = ErrorType<ApiError>>(sessionId: string, options?: { query?:UseQueryOptions<Awaited<ReturnType<typeof getDiscordSession>>, TError, TData>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getGetDiscordSessionQueryKey(sessionId);
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof getDiscordSession>>> = ({ signal }) => getDiscordSession(sessionId, { signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, enabled: sessionId !== null && sessionId !== undefined, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof getDiscordSession>>, TError, TData> & { queryKey: QueryKey }
+}
+
+export type GetDiscordSessionQueryResult = NonNullable<Awaited<ReturnType<typeof getDiscordSession>>>
+export type GetDiscordSessionQueryError = ErrorType<ApiError>
+
+
+/**
+ * @summary Get session status and results
+ */
+
+export function useGetDiscordSession<TData = Awaited<ReturnType<typeof getDiscordSession>>, TError = ErrorType<ApiError>>(
+ sessionId: string, options?: { query?:UseQueryOptions<Awaited<ReturnType<typeof getDiscordSession>>, TError, TData>, request?: SecondParameter<typeof customFetch>}
+
+ ):  UseQueryResult<TData, TError> & { queryKey: QueryKey } {
+
+  const queryOptions = getGetDiscordSessionQueryOptions(sessionId,options)
+
+  const query = useQuery(queryOptions) as  UseQueryResult<TData, TError> & { queryKey: QueryKey };
+
+  return withQueryKey(query, queryOptions.queryKey);
+}
+
+
+
+
+
+
+
+export const getCancelDiscordSessionUrl = (sessionId: string,) => {
+
+
+
+
+  return `/api/discord/sessions/${sessionId}`
+}
+
+/**
+ * @summary Cancel a running search session
+ */
+export const cancelDiscordSession = async (sessionId: string, options?: Parameters<typeof customFetch>[1]): Promise<DiscordSession> => {
+
+  return customFetch<DiscordSession>(getCancelDiscordSessionUrl(sessionId),
+  {
+    ...options,
+    method: 'DELETE'
+
+
+  }
+);}
+
+
+
+
+
+export const getCancelDiscordSessionMutationOptions = <TError = ErrorType<ApiError>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof cancelDiscordSession>>, TError,{sessionId: string}, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof cancelDiscordSession>>, TError,{sessionId: string}, TContext> => {
+
+const mutationKey = ['cancelDiscordSession'];
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof cancelDiscordSession>>, {sessionId: string}> = (props) => {
+          const {sessionId} = props ?? {};
+
+          return  cancelDiscordSession(sessionId,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type CancelDiscordSessionMutationResult = NonNullable<Awaited<ReturnType<typeof cancelDiscordSession>>>
+
+    export type CancelDiscordSessionMutationError = ErrorType<ApiError>
+
+    /**
+ * @summary Cancel a running search session
+ */
+export const useCancelDiscordSession = <TError = ErrorType<ApiError>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof cancelDiscordSession>>, TError,{sessionId: string}, TContext>, request?: SecondParameter<typeof customFetch>}
+ ): UseMutationResult<
+        Awaited<ReturnType<typeof cancelDiscordSession>>,
+        TError,
+        {sessionId: string},
+        TContext
+      > => {
+      return useMutation(getCancelDiscordSessionMutationOptions(options));
+    }
+
+export const getVerifyDiscordUsernameUrl = (username: string,) => {
+
+
+
+
+  return `/api/discord/verify/${username}`
+}
+
+/**
+ * Runs a fresh availability check on a single username and returns the result with a confidence level.
+ * @summary Verify a specific Discord username's availability
+ */
+export const verifyDiscordUsername = async (username: string, options?: Parameters<typeof customFetch>[1]): Promise<DiscordVerifyResult> => {
+
+  return customFetch<DiscordVerifyResult>(getVerifyDiscordUsernameUrl(username),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getVerifyDiscordUsernameQueryKey = (username: string,) => {
+    return [
+    `/api/discord/verify/${username}`
+    ] as const;
+    }
+
+
+export const getVerifyDiscordUsernameQueryOptions = <TData = Awaited<ReturnType<typeof verifyDiscordUsername>>, TError = ErrorType<ApiError>>(username: string, options?: { query?:UseQueryOptions<Awaited<ReturnType<typeof verifyDiscordUsername>>, TError, TData>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getVerifyDiscordUsernameQueryKey(username);
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof verifyDiscordUsername>>> = ({ signal }) => verifyDiscordUsername(username, { signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, enabled: username !== null && username !== undefined, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof verifyDiscordUsername>>, TError, TData> & { queryKey: QueryKey }
+}
+
+export type VerifyDiscordUsernameQueryResult = NonNullable<Awaited<ReturnType<typeof verifyDiscordUsername>>>
+export type VerifyDiscordUsernameQueryError = ErrorType<ApiError>
+
+
+/**
+ * @summary Verify a specific Discord username's availability
+ */
+
+export function useVerifyDiscordUsername<TData = Awaited<ReturnType<typeof verifyDiscordUsername>>, TError = ErrorType<ApiError>>(
+ username: string, options?: { query?:UseQueryOptions<Awaited<ReturnType<typeof verifyDiscordUsername>>, TError, TData>, request?: SecondParameter<typeof customFetch>}
+
+ ):  UseQueryResult<TData, TError> & { queryKey: QueryKey } {
+
+  const queryOptions = getVerifyDiscordUsernameQueryOptions(username,options)
+
+  const query = useQuery(queryOptions) as  UseQueryResult<TData, TError> & { queryKey: QueryKey };
+
+  return withQueryKey(query, queryOptions.queryKey);
+}
+
+
+
+
+
+
+
+export const getStreamDiscordSessionUrl = (sessionId: string,) => {
+
+
+
+
+  return `/api/discord/sessions/${sessionId}/stream`
+}
+
+/**
+ * @summary Stream live results via SSE
+ */
+export const streamDiscordSession = async (sessionId: string, options?: Parameters<typeof customFetch>[1]): Promise<string> => {
+
+  return customFetch<string>(getStreamDiscordSessionUrl(sessionId),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getStreamDiscordSessionQueryKey = (sessionId: string,) => {
+    return [
+    `/api/discord/sessions/${sessionId}/stream`
+    ] as const;
+    }
+
+
+export const getStreamDiscordSessionQueryOptions = <TData = Awaited<ReturnType<typeof streamDiscordSession>>, TError = ErrorType<unknown>>(sessionId: string, options?: { query?:UseQueryOptions<Awaited<ReturnType<typeof streamDiscordSession>>, TError, TData>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getStreamDiscordSessionQueryKey(sessionId);
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof streamDiscordSession>>> = ({ signal }) => streamDiscordSession(sessionId, { signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, enabled: sessionId !== null && sessionId !== undefined, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof streamDiscordSession>>, TError, TData> & { queryKey: QueryKey }
+}
+
+export type StreamDiscordSessionQueryResult = NonNullable<Awaited<ReturnType<typeof streamDiscordSession>>>
+export type StreamDiscordSessionQueryError = ErrorType<unknown>
+
+
+/**
+ * @summary Stream live results via SSE
+ */
+
+export function useStreamDiscordSession<TData = Awaited<ReturnType<typeof streamDiscordSession>>, TError = ErrorType<unknown>>(
+ sessionId: string, options?: { query?:UseQueryOptions<Awaited<ReturnType<typeof streamDiscordSession>>, TError, TData>, request?: SecondParameter<typeof customFetch>}
+
+ ):  UseQueryResult<TData, TError> & { queryKey: QueryKey } {
+
+  const queryOptions = getStreamDiscordSessionQueryOptions(sessionId,options)
 
   const query = useQuery(queryOptions) as  UseQueryResult<TData, TError> & { queryKey: QueryKey };
 

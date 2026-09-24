@@ -7,6 +7,16 @@
  */
 
 export * from './apiError';
+export * from './discordGenerationConfig';
+export * from './discordGenerationConfigParams';
+export * from './discordGenerationMode';
+export * from './discordResult';
+export * from './discordResultStatus';
+export * from './discordSearchInput';
+export * from './discordSession';
+export * from './discordSessionState';
+export * from './discordVerifyResult';
+export * from './discordVerifyResultConfidence';
 export * from './gamertagResult';
 export * from './gamertagResultPolicy';
 export * from './gamertagResultPolicyStatus';

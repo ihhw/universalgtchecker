@@ -4,10 +4,12 @@ import { Route, Switch, Router as WouterRouter } from "wouter";
 import { Toaster } from "sonner";
 import { AppShell } from "@/components/app-shell";
 import { CheckerProvider } from "@/state/checker";
+import { DiscordCheckerProvider } from "@/state/discord-checker";
 import HomePage from "@/pages/home";
 import DiagnosticsPage from "@/pages/diagnostics";
 import XboxPage from "@/pages/xbox";
 import SniperPage from "@/pages/sniper";
+import DiscordPage from "@/pages/discord";
 import HitsPage from "@/pages/hits";
 import ActivityPage from "@/pages/activity";
 import StatusPage from "@/pages/status";
@@ -26,6 +28,7 @@ function Routes() {
       <Route path="/" component={HomePage} />
       <Route path="/xbox" component={XboxPage} />
       <Route path="/xbox/sniper" component={SniperPage} />
+      <Route path="/discord" component={DiscordPage} />
       <Route path="/hits" component={HitsPage} />
       <Route path="/analytics">
         <Suspense fallback={<p className="py-10 text-center text-sm text-muted-foreground">Loading…</p>}>
@@ -46,9 +49,11 @@ export default function App() {
     <QueryClientProvider client={queryClient}>
       <WouterRouter base={import.meta.env.BASE_URL.replace(/\/$/, "")}>
         <CheckerProvider>
-          <AppShell>
-            <Routes />
-          </AppShell>
+          <DiscordCheckerProvider>
+            <AppShell>
+              <Routes />
+            </AppShell>
+          </DiscordCheckerProvider>
         </CheckerProvider>
       </WouterRouter>
       <Toaster

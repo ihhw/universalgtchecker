@@ -5,21 +5,21 @@
  * Xbox Gamertag Finder API
  * OpenAPI spec version: 0.1.0
  */
-import type { GamertagResult } from './gamertagResult';
-import type { GamertagSessionState } from './gamertagSessionState';
-import type { GenerationMode } from './generationMode';
+import type { DiscordGenerationMode } from './discordGenerationMode';
+import type { DiscordResult } from './discordResult';
+import type { DiscordSessionState } from './discordSessionState';
 
-export interface GamertagSession {
+export interface DiscordSession {
   sessionId: string;
-  mode: GenerationMode;
+  mode: DiscordGenerationMode;
   /** Short mode label shown in the live feed */
   label: string;
   rate: number;
-  state: GamertagSessionState;
+  state: DiscordSessionState;
   attempts: number;
   found: number;
   taken?: number;
   unknown?: number;
   paused?: boolean;
-  results: GamertagResult[];
+  results: DiscordResult[];
 }
