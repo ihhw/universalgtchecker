@@ -11,6 +11,7 @@ import XboxPage from "@/pages/xbox";
 import SniperPage from "@/pages/sniper";
 import DiscordPage from "@/pages/discord";
 import HitsPage from "@/pages/hits";
+import DiscordHitsPage from "@/pages/discord-hits";
 import ActivityPage from "@/pages/activity";
 import StatusPage from "@/pages/status";
 import SettingsPage from "@/pages/settings";
@@ -29,6 +30,7 @@ function Routes() {
       <Route path="/xbox" component={XboxPage} />
       <Route path="/xbox/sniper" component={SniperPage} />
       <Route path="/discord" component={DiscordPage} />
+      <Route path="/discord/hits" component={DiscordHitsPage} />
       <Route path="/hits" component={HitsPage} />
       <Route path="/analytics">
         <Suspense fallback={<p className="py-10 text-center text-sm text-muted-foreground">Loading…</p>}>

@@ -147,7 +147,7 @@ export const StreamGamertagSessionResponse = zod.unknown()
  * Creates a new search session and returns a sessionId. Connect to /discord/sessions/{sessionId}/stream (SSE) for live results.
  * @summary Start a Discord username search session
  */
-export const startDiscordSearchBodyRateMax = 50;
+export const startDiscordSearchBodyRateMax = 500;
 
 
 
@@ -156,7 +156,7 @@ export const StartDiscordSearchBody = zod.object({
   "mode": zod.enum(['random', 'letters', 'numbers', 'mixed', 'repetitive', 'sequential', 'alternating', 'pattern', 'symbol', 'word', 'word_pair', 'word_num_word', 'list']).describe('Discord generation mode'),
   "params": zod.record(zod.string(), zod.unknown()).optional().describe('Settings for the selected mode. Validated server-side.')
 }),
-  "rate": zod.number().min(1).max(startDiscordSearchBodyRateMax).describe('Checks per second')
+  "rate": zod.number().min(1).max(startDiscordSearchBodyRateMax).describe('Checks per second. The actual ceiling enforced by the server is lower (50) unless proxies are configured (500); this is the outer bound accepted by the schema.')
 })
 
 export const StartDiscordSearchResponse = zod.object({

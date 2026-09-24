@@ -11,9 +11,25 @@
  * This checker therefore only checks and alerts — it never attempts to claim.
  */
 
+import { fetch as undiciFetch, ProxyAgent, type Dispatcher } from "undici";
 import { logger } from "./logger";
+import { getProxies } from "./discord-proxy-store";
 
 export type ResultStatus = "available" | "taken" | "unknown" | "error";
+
+/** Rate ceiling shown to and enforced for the client — higher once proxies spread the load. */
+export const MAX_RATE_NO_PROXY = 50;
+export const MAX_RATE_WITH_PROXY = 500;
+
+export function currentMaxRate(): number {
+  return getProxies().length > 0 ? MAX_RATE_WITH_PROXY : MAX_RATE_NO_PROXY;
+}
+
+/** Worker concurrency scales with the proxy pool; one IP alone can't sustain much in flight. */
+export function currentMaxConcurrency(): number {
+  const n = getProxies().length;
+  return n > 0 ? Math.min(200, Math.max(20, n * 4)) : 20;
+}
 
 const HOSTS = ["https://discord.com", "https://canary.discord.com", "https://ptb.discord.com"];
 const PATH = "/api/v9/unique-username/username-attempt-unauthed";
@@ -83,7 +99,10 @@ function headersFor(host: string): Record<string, string> {
   };
 }
 
-/** Simple process-wide circuit breaker: back off together after repeated 429s. */
+/**
+ * Process-wide circuit breaker used only when there are no proxies (one
+ * shared IP): back off together after repeated 429s.
+ */
 let cooldownUntil = 0;
 let consecutive429 = 0;
 const CIRCUIT_THRESHOLD = 4;
@@ -104,47 +123,120 @@ export function msUntilReady(): number {
   return Math.max(0, cooldownUntil - Date.now());
 }
 
+/**
+ * Per-proxy round-robin with a cooldown for proxies that keep failing, so a
+ * few bad ones in a large list don't drag down the whole pool.
+ */
+interface ProxyState {
+  deadUntil: number;
+  consecutiveFail: number;
+}
+const proxyStates = new Map<string, ProxyState>();
+const proxyAgents = new Map<string, ProxyAgent>();
+let proxyCursor = 0;
+
+function agentFor(proxy: string): ProxyAgent {
+  let agent = proxyAgents.get(proxy);
+  if (!agent) {
+    agent = new ProxyAgent(proxy);
+    proxyAgents.set(proxy, agent);
+  }
+  return agent;
+}
+
+function pickProxy(proxies: string[]): string | null {
+  if (proxies.length === 0) return null;
+  const now = Date.now();
+  for (let i = 0; i < proxies.length; i++) {
+    const idx = (proxyCursor + i) % proxies.length;
+    const candidate = proxies[idx]!;
+    const state = proxyStates.get(candidate);
+    if (!state || state.deadUntil <= now) {
+      proxyCursor = idx + 1;
+      return candidate;
+    }
+  }
+  // Every proxy is cooling down: use one anyway rather than stalling entirely.
+  const candidate = proxies[proxyCursor % proxies.length]!;
+  proxyCursor++;
+  return candidate;
+}
+
+const PROXY_DEAD_STRIKES = 3;
+const PROXY_DEAD_COOLDOWN_MS = 30_000;
+
+function markProxyFail(proxy: string): void {
+  const state = proxyStates.get(proxy) ?? { deadUntil: 0, consecutiveFail: 0 };
+  state.consecutiveFail++;
+  if (state.consecutiveFail >= PROXY_DEAD_STRIKES) {
+    state.deadUntil = Date.now() + PROXY_DEAD_COOLDOWN_MS;
+    state.consecutiveFail = 0;
+  }
+  proxyStates.set(proxy, state);
+}
+function markProxyOk(proxy: string): void {
+  proxyStates.set(proxy, { deadUntil: 0, consecutiveFail: 0 });
+}
+
 export async function checkDiscordUsername(username: string, signal: AbortSignal): Promise<ResultStatus> {
-  const wait = msUntilReady();
-  if (wait > 0) {
-    await new Promise<void>((resolve) => {
-      const t = setTimeout(resolve, Math.min(wait, 3_000));
-      signal.addEventListener("abort", () => { clearTimeout(t); resolve(); }, { once: true });
-    });
+  const proxies = getProxies();
+  const proxy = pickProxy(proxies);
+
+  // The shared, no-proxy circuit breaker only applies when every check comes
+  // from this server's one IP; with a pool, a single bad proxy shouldn't
+  // pause every other in-flight check.
+  if (!proxy) {
+    const wait = msUntilReady();
+    if (wait > 0) {
+      await new Promise<void>((resolve) => {
+        const t = setTimeout(resolve, Math.min(wait, 3_000));
+        signal.addEventListener("abort", () => { clearTimeout(t); resolve(); }, { once: true });
+      });
+    }
   }
 
   const host = HOSTS[Math.floor(Math.random() * HOSTS.length)]!;
+  let dispatcher: Dispatcher | undefined;
   try {
-    const res = await fetch(host + PATH, {
+    if (proxy) dispatcher = agentFor(proxy);
+  } catch (err) {
+    logger.warn({ proxy, err }, "Could not build proxy agent; falling back to a direct request");
+    dispatcher = undefined;
+  }
+
+  try {
+    const res = await undiciFetch(host + PATH, {
       method: "POST",
       signal,
       headers: headersFor(host),
       body: JSON.stringify({ username }),
+      dispatcher,
     });
 
     let body = "";
     try { body = await res.text(); } catch { /* ignore */ }
 
     if (looksLikeChallenge(body)) {
-      noteRateLimited();
+      if (proxy) markProxyFail(proxy); else noteRateLimited();
       return "unknown";
     }
     if (res.status === 429 || res.status === 401 || res.status === 403) {
-      noteRateLimited();
+      if (proxy) markProxyFail(proxy); else noteRateLimited();
       return "unknown";
     }
     if (!res.ok) {
-      logger.warn({ username, status: res.status }, "Discord availability check unexpected status");
+      logger.warn({ username, status: res.status, proxied: proxy !== null }, "Discord availability check unexpected status");
+      if (proxy) markProxyFail(proxy);
       return "error";
     }
 
-    noteOk();
+    if (proxy) markProxyOk(proxy); else noteOk();
     let data: unknown;
     try { data = JSON.parse(body); } catch { return "error"; }
     const taken = (data as { taken?: unknown } | null)?.taken;
     if (typeof taken === "boolean") return taken ? "taken" : "available";
     if ((data as { rate_limited?: unknown } | null)?.rate_limited) {
-      noteRateLimited();
+      if (proxy) markProxyFail(proxy); else noteRateLimited();
       return "unknown";
     }
     return "unknown";
@@ -152,6 +244,7 @@ export async function checkDiscordUsername(username: string, signal: AbortSignal
     if (err instanceof Error && (err.name === "AbortError" || err.name === "TimeoutError")) {
       throw err;
     }
+    if (proxy) markProxyFail(proxy);
     return "error";
   }
 }

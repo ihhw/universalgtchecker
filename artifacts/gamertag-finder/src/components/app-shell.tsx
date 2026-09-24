@@ -15,19 +15,20 @@ const PLATFORMS: NavGroup[] = [
     items: [
       { label: "Checker", href: "/xbox" },
       { label: "Sniper", href: "/xbox/sniper" },
+      { label: "Hits", href: "/hits" },
     ],
   },
   {
     label: "Discord",
     items: [
       { label: "Checker", href: "/discord" },
+      { label: "Hits", href: "/discord/hits" },
     ],
   },
 ];
 
 const WORKSPACE: NavItem[] = [
   { label: "Home", href: "/" },
-  { label: "Hits", href: "/hits" },
   { label: "Analytics", href: "/analytics" },
   { label: "Live activity", href: "/activity" },
   { label: "System status", href: "/status" },

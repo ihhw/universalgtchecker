@@ -61,7 +61,7 @@ function Chip({ children, tone }: { children: string; tone: "gold" | "muted" }) 
 
 export default function HitsPage() {
   const c = useChecker();
-  const hits = [...c.hits].reverse();
+  const hits = [...c.hits].filter((h) => h.platform === "xbox").reverse();
 
   return (
     <>

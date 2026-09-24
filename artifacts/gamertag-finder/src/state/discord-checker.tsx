@@ -28,7 +28,8 @@ const MODE_KEY = "universal-discord-mode";
 const PARAMS_KEY = "universal-discord-params";
 const TEMPLATES_KEY = "universal-discord-templates";
 const MAX_SAVED_TEMPLATES = 20;
-export const DISCORD_MAX_RATE = 50;
+/** Ceiling with no proxies configured; the server raises this once proxies are set. */
+export const DISCORD_DEFAULT_MAX_RATE = 50;
 
 interface DiscordCheckerContextValue {
   // generation settings
@@ -46,6 +47,10 @@ interface DiscordCheckerContextValue {
   // search settings
   rate: number;
   setRate: (n: number) => void;
+  /** Current server-enforced rate ceiling (higher once proxies are configured). */
+  maxRate: number;
+  proxyCount: number;
+  refreshProxyState: () => Promise<void>;
   // session
   sessionId: string | null;
   snapshot: DiscordSessionSnapshot | null;
@@ -113,9 +118,24 @@ export function DiscordCheckerProvider({ children }: { children: ReactNode }) {
   const [savedTemplates, setSavedTemplates] = useState<TemplateDef[]>(readTemplates);
   const [validation, setValidation] = useState<ConfigValidation>({ status: "checking", errors: [], label: "", info: {}, samples: [] });
 
+  const [maxRate, setMaxRate] = useState(DISCORD_DEFAULT_MAX_RATE);
+  const [proxyCount, setProxyCount] = useState(0);
+
+  const refreshProxyState = useCallback(async () => {
+    try {
+      const res = await fetch(api("/discord/settings/proxies"));
+      if (!res.ok) return;
+      const d = (await res.json()) as { count?: number; maxRate?: number };
+      if (typeof d.maxRate === "number") setMaxRate(d.maxRate);
+      if (typeof d.count === "number") setProxyCount(d.count);
+    } catch { /* leave previous state */ }
+  }, []);
+
+  useEffect(() => { void refreshProxyState(); }, [refreshProxyState]);
+
   const [rate, setRateState] = useState(() => {
     const n = Number(readStored(RATE_KEY));
-    return Number.isFinite(n) && n >= 1 && n <= DISCORD_MAX_RATE ? Math.round(n) : 8;
+    return Number.isFinite(n) && n >= 1 && n <= DISCORD_DEFAULT_MAX_RATE ? Math.round(n) : 8;
   });
 
   const [sessionId, setSessionId] = useState<string | null>(() => {
@@ -227,10 +247,10 @@ export function DiscordCheckerProvider({ children }: { children: ReactNode }) {
 
   // ── Search settings ────────────────────────────────────────────────────────
   const setRate = useCallback((n: number) => {
-    const v = Math.min(DISCORD_MAX_RATE, Math.max(1, Math.round(n) || 1));
+    const v = Math.min(maxRate, Math.max(1, Math.round(n) || 1));
     setRateState(v);
     writeStored(RATE_KEY, String(v));
-  }, []);
+  }, [maxRate]);
 
   // ── Session controls ───────────────────────────────────────────────────────
   const isRunning = sessionId !== null && (snapshot === null || snapshot.state === "running");
@@ -307,12 +327,12 @@ export function DiscordCheckerProvider({ children }: { children: ReactNode }) {
     mode, setMode, params, setParams, validation,
     builtinTemplates: DISCORD_BUILTIN_TEMPLATES, savedTemplates, applyTemplate, saveTemplate, deleteTemplate,
     templateSourceLabel: DISCORD_MODE_BY_ID[lastRealMode]?.label ?? "",
-    rate, setRate,
+    rate, setRate, maxRate, proxyCount, refreshProxyState,
     sessionId, snapshot, isRunning, isPaused, starting, start, stop, togglePause, reset,
     feed, feedConnected, clearFeed, hits,
   }), [
     mode, setMode, params, setParams, validation, savedTemplates, applyTemplate, saveTemplate, deleteTemplate, lastRealMode,
-    rate, setRate,
+    rate, setRate, maxRate, proxyCount, refreshProxyState,
     sessionId, snapshot, isRunning, isPaused, starting, start, stop, togglePause, reset,
     feed, feedConnected, clearFeed, hits,
   ]);

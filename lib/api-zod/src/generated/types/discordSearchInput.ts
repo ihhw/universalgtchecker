@@ -10,9 +10,9 @@ import type { DiscordGenerationConfig } from './discordGenerationConfig';
 export interface DiscordSearchInput {
   config: DiscordGenerationConfig;
   /**
-     * Checks per second
+     * Checks per second. The actual ceiling enforced by the server is lower (50) unless proxies are configured (500); this is the outer bound accepted by the schema.
      * @minimum 1
-     * @maximum 50
+     * @maximum 500
      */
   rate: number;
 }

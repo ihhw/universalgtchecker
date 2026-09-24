@@ -3,7 +3,8 @@ import { Pause, Play, Square } from "lucide-react";
 import { Panel, Eyebrow, PageHeader } from "@/components/panel";
 import { ActivityFeed } from "@/components/activity-feed";
 import { ModeForm, ModePicker, TemplatesPanel } from "@/components/mode-form";
-import { useDiscordChecker, DISCORD_MAX_RATE, type ConfigValidation } from "@/state/discord-checker";
+import { Link } from "wouter";
+import { useDiscordChecker, type ConfigValidation } from "@/state/discord-checker";
 import { DISCORD_MODE_BY_ID, DISCORD_LENGTH_MIN, DISCORD_LENGTH_MAX } from "@/lib/discord-modes";
 import { cn } from "@/lib/utils";
 
@@ -63,7 +64,7 @@ function ConfigStatus({ v }: { v: ConfigValidation }) {
 export default function DiscordPage() {
   const c = useDiscordChecker();
   const s = c.snapshot;
-  const fill = ((c.rate - 1) / (DISCORD_MAX_RATE - 1)) * 100;
+  const fill = ((c.rate - 1) / (c.maxRate - 1)) * 100;
   const def = DISCORD_MODE_BY_ID[c.mode]!;
   const canStart = c.validation.status === "ok";
 
@@ -154,7 +155,7 @@ export default function DiscordPage() {
               id="discord-rate"
               type="range"
               min={1}
-              max={DISCORD_MAX_RATE}
+              max={c.maxRate}
               step={1}
               value={c.rate}
               disabled={c.isRunning}
@@ -163,7 +164,14 @@ export default function DiscordPage() {
               className="range mt-2"
             />
             <p className="mt-2 text-xs text-muted-foreground">
-              Discord's unauthenticated check endpoint has no proxy pool behind it here, so the rate is capped well below the Xbox checker's.
+              {c.proxyCount > 0 ? (
+                <>Using {c.proxyCount.toLocaleString()} {c.proxyCount === 1 ? "proxy" : "proxies"} · rate capped at {c.maxRate}/s.{" "}</>
+              ) : (
+                <>No proxies configured, so the rate is capped at {c.maxRate}/s to avoid getting rate-limited on one IP.{" "}</>
+              )}
+              <Link href="/settings" className="underline hover:text-foreground">
+                {c.proxyCount > 0 ? "Manage proxies" : "Add proxies for a higher rate"}
+              </Link>
             </p>
           </div>
         </Panel>

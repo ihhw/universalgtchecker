@@ -12,11 +12,12 @@ import {
 } from "@workspace/api-zod";
 import { logger } from "../lib/logger";
 import { isBlockedByContentFilter } from "../lib/content-filter";
-import { checkDiscordUsername, type ResultStatus } from "../lib/discord-availability";
+import { checkDiscordUsername, currentMaxConcurrency, currentMaxRate, type ResultStatus } from "../lib/discord-availability";
 import { compileGeneration, type Generator } from "../lib/discord-generator";
 import { validateDiscordUsername } from "../lib/discord-validation";
 import { pushActivity } from "../lib/activity";
 import { getWebhookTarget, sendWebhookPayload } from "../lib/webhook-store";
+import { getPublicProxyState, setProxies, clearProxies } from "../lib/discord-proxy-store";
 
 const router: IRouter = Router();
 
@@ -160,12 +161,9 @@ function computeCps(session: Session): number {
 
 // ─── Search runner ───────────────────────────────────────────────────────────
 
-const MAX_RATE = 50;
-const MAX_CONCURRENCY = 20;
-
 async function runSearch(session: Session): Promise<void> {
   const { abort } = session;
-  const concurrency = Math.max(1, Math.min(MAX_CONCURRENCY, session.rate));
+  const concurrency = Math.max(1, Math.min(currentMaxConcurrency(), session.rate));
   const sem = new Semaphore(concurrency);
   const minIntervalMs = Math.max(0, Math.ceil((concurrency / session.rate) * 1_000));
 
@@ -353,8 +351,9 @@ router.post("/discord/search", async (req: Request, res: Response): Promise<void
   }
 
   const { config, rate } = parsed.data;
-  if (!Number.isFinite(rate) || rate < 1 || rate > MAX_RATE) {
-    res.status(400).json({ error: `Rate must be between 1 and ${MAX_RATE} checks per second.` });
+  const maxRate = currentMaxRate();
+  if (!Number.isFinite(rate) || rate < 1 || rate > maxRate) {
+    res.status(400).json({ error: `Rate must be between 1 and ${maxRate} checks per second.` });
     return;
   }
 
@@ -510,6 +509,37 @@ router.get("/discord/sessions/:sessionId/stream", async (req, res): Promise<void
   req.on("close", () => {
     session.sseClients = session.sseClients.filter((c) => c !== res);
   });
+});
+
+// ─── Proxy settings ─────────────────────────────────────────────────────────
+//
+// Discord's unauthenticated endpoint rate-limits a single IP hard. Proxies
+// are optional: without any, the checker stays under MAX_RATE_NO_PROXY;
+// with some, load spreads across them and a much higher rate is allowed.
+// Proxy URLs can carry credentials, so — like the Discord webhook — they are
+// stored only on the server and never returned to the browser.
+
+router.get("/discord/settings/proxies", (_req, res): void => {
+  res.json({ ...getPublicProxyState(), maxRate: currentMaxRate() });
+});
+
+router.put("/discord/settings/proxies", (req, res): void => {
+  const body = (req.body ?? {}) as { proxies?: unknown };
+  if (typeof body.proxies !== "string") {
+    res.status(400).json({ error: "proxies must be a string (one per line)." });
+    return;
+  }
+  const result = setProxies(body.proxies);
+  if (!result.ok) {
+    res.status(400).json({ error: result.error });
+    return;
+  }
+  res.json({ ...getPublicProxyState(), maxRate: currentMaxRate(), skipped: result.skipped });
+});
+
+router.delete("/discord/settings/proxies", (_req, res): void => {
+  clearProxies();
+  res.json({ ...getPublicProxyState(), maxRate: currentMaxRate() });
 });
 
 /** Lightweight counters for the system-status endpoint. */

@@ -59,6 +59,17 @@ artifacts/api-server/results.txt
 artifacts/api-server/state.json
 artifacts/api-server/discord-results.txt
 artifacts/api-server/discord-state.json
+artifacts/api-server/discord-proxies.json
+# Same files, ignored again bare: packaging/windows/start.cmd (and the
+# systemd unit in packaging/linux-app) run the built server with the repo
+# root as its cwd, not artifacts/api-server, so these can land at the root.
+discord-results.txt
+discord-state.json
+discord-proxies.json
+results.txt
+state.json
+stats.json
+webhook.json
 artifacts/discord-bot/search_state.json
 
 artifacts/api-server/webhook.json
