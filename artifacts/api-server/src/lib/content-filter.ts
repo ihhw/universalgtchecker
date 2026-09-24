@@ -3,14 +3,17 @@
  *
  * Xbox's policy engine scans the gamertag as a single string of uppercase
  * characters (spaces and punctuation stripped) and rejects it if any known
- * blocked substring is found.  This pre-check lets us skip HTTP requests for
+ * blocked substring is found. This pre-check lets us skip HTTP requests for
  * tags that Xbox would always refuse, improving accuracy and saving rate-limit
  * budget.
  *
- * The list covers: profanity stems, sexual/violence abbreviations, slur
- * fragments, and patterns Xbox is known to block in short (3-5 char) tags.
- * It is intentionally conservative — false negatives (a blocked tag slipping
- * through) are preferable to false positives (a clean tag being skipped).
+ * Scope: this list is deliberately narrow — slurs, hate/extremist terms, and
+ * self-harm terms only. It is not a general profanity filter: mild swearing,
+ * sexual references and most short/ambiguous fragments are left to Xbox's own
+ * policy check (Double Check) rather than pre-filtered here, since blocking
+ * them locally has a much higher false-positive rate against ordinary short
+ * gamertags and words. Removing entries from this remaining list is a
+ * deliberate choice not made lightly; ask rather than editing it further.
  *
  * ── Normalization rules ───────────────────────────────────────────────────────
  * Before substring-matching, four normalized variants of the gamertag are
@@ -24,74 +27,18 @@
 
 // Every entry is compared against the UPPERCASE gamertag as a substring.
 const BLOCKED_SUBSTRINGS: readonly string[] = [
-  // ── Profanity stems (3-4 chars, unambiguous) ─────────────────────────────
-  "FKU", "FUK", "FCK", "FUC", "FUQ",
-  "SHT", "SH1T",
-  "SLT", "SL0T",
-  "ASS", "ARS", "AZZ",
-  "BST",
-  "GFY",
-  "KYS", "KMS",
-  "WNK", "JRK",
-  "TWAT", "CNT",
-  "SUCK", "SUCC",
-
-  // ── Sexual / explicit abbreviations (3+ chars) ───────────────────────────
-  "VAG", "VGN",
-  "COC", "COK", "CKS",
-  "DIK", "DIC", "DIQ",
-  "PNS", "PNIS",
-  "TIT",
-  "JZZ", "JIZ", "JZM",
-  "CUM", "KUM",
-  "SEX", "SEXY",
-  "ANAL",
-
-  // ── PUSSY variants ────────────────────────────────────────────────────────
-  "PUSSY", "PUSY", "POSY", "PSE",
-
-  // ── Full words (4L, 5L, 4C) ──────────────────────────────────────────────
-  "FUCK", "SHIT", "CUNT", "PISS", "COCK", "DICK",
-  "SLUT", "BITCH", "WHORE",
-  "RAPE", "RAPING", "RAPED",
+  // ── Slurs ──────────────────────────────────────────────────────────────
   "NIGGA", "NIGGER", "NEGRO",
-  "CHINK", "SPICK", "KIKE", "WANK",
-  "BASTARD",
+  "CHINK", "SPICK", "KIKE",
+  "FAG", "FAGT", "FGT",
 
   // ── Hate / extremism ─────────────────────────────────────────────────────
   "KKK",
   "NAZI", "NSDAP",
   "ISIS", "ISIL",
 
-  // ── Violence / self-harm (4+ chars only — shorter ones false-positive) ───
-  "KILL", "DEAD", "BOMB",
-
-  // ── Drug references (4+ chars) ───────────────────────────────────────────
-  "WEED", "COKE", "METH", "DRUG",
-
-  // ── Slurs / misc confirmed Xbox blocks ───────────────────────────────────
-  "FAG", "FAGT", "FGT",
-  "DYK",
-
-  // ── User-specified block list ─────────────────────────────────────────────
-  "POC",                    // racial slur abbreviation
-  "PSY",                    // flagged by Xbox content policy
-  "SLOT", "SLXT",           // SLUT leetspeak variants
-  "HELL", "HXLL",           // HELL and vowel-replaced variant
-  "FAQ",                    // FUCK phonetic variant
-  "FAK",                    // FUCK phonetic variant
-  "POSE",                   // user-requested block
-
-  // ── FUCK/SUCK phonetic/leet variants ─────────────────────────────────────
-  "SUXK",
-  "FOOQ", "FUQQ",
-  "FQU", "FCU",
-  "FKN", "FKNG",
-  "FAKN",
-  "FXK", "FXQ",             // X-wildcard FUCK variants
-
-  // ── DK (short for DICK) ──────────────────────────────────────────────────
-  "DK",
+  // ── Self-harm ─────────────────────────────────────────────────────────────
+  "KYS", "KMS",
 ];
 
 // De-duplicate and sort by length descending so longer patterns are checked first.

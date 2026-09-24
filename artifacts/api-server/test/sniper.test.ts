@@ -42,7 +42,7 @@ test("config validation: bad tag, content-filtered tag, interval bounds", async 
   if (!r1.ok) assert.match(r1.error, /start with a letter/);
   const r2 = await sniper.startSniper({ target: "ValidTag", intervalMs: 100 });
   assert.equal(r2.ok, false);
-  const r3 = await sniper.startSniper({ target: "FUCKER" });
+  const r3 = await sniper.startSniper({ target: "NAZIFAN" });
   assert.equal(r3.ok, false);
 });
 
