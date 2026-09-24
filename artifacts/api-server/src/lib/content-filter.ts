@@ -92,12 +92,6 @@ const BLOCKED_SUBSTRINGS: readonly string[] = [
 
   // ── DK (short for DICK) ──────────────────────────────────────────────────
   "DK",
-
-  // ── Short user-requested blocks (2-3 chars) ───────────────────────────────
-  // These have higher false-positive risk on short letter and word modes; user explicitly requested.
-  "QM",
-  "FQ",
-  "FK",
 ];
 
 // De-duplicate and sort by length descending so longer patterns are checked first.
