@@ -64,6 +64,34 @@ test("Double Check still gates auto-claim: policy 409 → UNKNOWN, not alertable
   assert.equal(calls("reserve").length, 0);
 });
 
+test("Double Check 200 offering only a suffixed name → UNKNOWN, not alertable, never claimed", async () => {
+  // Xbox can answer 200 while only offering the name with a suffix attached
+  // (or a different classicGamertag) — the exact typed name is actually
+  // taken even though the HTTP status alone looks like an approval.
+  await control(mock.url, {
+    sticky: { policy: { status: 200, body: { classicGamertag: "SuffixTag", gamertag: "SuffixTag", gamertagSuffix: "4821" } } },
+  });
+  const { snap } = await runList(["SuffixTag"], { runEthanPolicyCheck: true, autoClaim: true });
+  const r = snap.results[0];
+  assert.equal(r.status, "unknown");
+  assert.equal(r.policy.status, "unavailable");
+  assert.match(r.policy.message, /#4821/);
+  assert.equal(r.alertable, false);
+  await new Promise((res) => setTimeout(res, 200));
+  assert.equal(calls("reserve").length, 0, "never attempts a claim on a name Xbox would only offer with a suffix");
+});
+
+test("Double Check 200 with no suffix and a matching name → still APPROVED (no false regression)", async () => {
+  await control(mock.url, {
+    sticky: { policy: { status: 200, body: { classicGamertag: "CleanTag", gamertag: "CleanTag", gamertagSuffix: "" } } },
+  });
+  const { snap } = await runList(["CleanTag"], { runEthanPolicyCheck: true });
+  const r = snap.results[0];
+  assert.equal(r.status, "available");
+  assert.equal(r.policy.status, "approved");
+  assert.equal(r.alertable, true);
+});
+
 test("auto-claim OFF → hits are reported, nothing is claimed; Double Check OFF classification unchanged", async () => {
   const { snap } = await runList(["TakenTag", "FreeOnly"], { autoClaim: false });
   const statuses = Object.fromEntries(snap.results.map((r: any) => [r.gamertag, `${r.status}/${r.alertable}`]));

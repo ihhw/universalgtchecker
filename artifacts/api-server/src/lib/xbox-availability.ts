@@ -212,11 +212,39 @@ export async function runEthanPolicyCheck(
       const response = opts.fast
         ? await fastFetch(ETHAN_POLICY_URL, init)
         : await fetch(xboxUrl(ETHAN_POLICY_URL), init);
-      // Drain the body so the keep-alive socket can be reused.
-      if (opts.fast) void response.text().catch(() => undefined);
       const httpStatus = response.status;
+      // Drain the body on every non-200 path so the keep-alive socket can be
+      // reused; the 200 path below reads the body itself instead.
+      if (opts.fast && response.status !== 200) void response.text().catch(() => undefined);
 
-      if (response.status === 200) { notePolicyOk(accountId); return { status: "approved", httpStatus }; }
+      if (response.status === 200) {
+        notePolicyOk(accountId);
+        // A 200 here does not by itself guarantee the *exact* gamertag is
+        // reservable — like the separate reserve call the claim flow makes,
+        // Xbox can respond 200 while only offering the name with a suffix
+        // (gamertagSuffix / a different classicGamertag) attached, meaning
+        // the exact typed name is actually taken. Reported as "available"
+        // without checking this, a hit could pass Double Check and still
+        // turn out to need a suffix when actually claimed. If the body
+        // doesn't parse or doesn't carry these fields, this is a no-op and
+        // the check passes through as approved, same as before.
+        let body = "";
+        try { body = await response.text(); } catch { /* treat as approved below */ }
+        try {
+          const data = JSON.parse(body) as { classicGamertag?: string; gamertag?: string; gamertagSuffix?: string };
+          const offered = data.classicGamertag ?? data.gamertag;
+          const suffix = (data.gamertagSuffix ?? "").trim();
+          const offeredDiffers = typeof offered === "string" && offered.trim().toUpperCase() !== gamertag.trim().toUpperCase();
+          if (suffix || offeredDiffers) {
+            return {
+              status: "unavailable",
+              message: `Xbox would only reserve "${offered ?? gamertag}${suffix ? `#${suffix}` : ""}", not the exact "${gamertag}".`,
+              httpStatus,
+            };
+          }
+        } catch { /* not JSON, or missing fields: treat as approved */ }
+        return { status: "approved", httpStatus };
+      }
       if (response.status === 400) { notePolicyOk(accountId); return { status: "banned", message: "Xbox marked this gamertag as unacceptable.", httpStatus }; }
       if (response.status === 409) { notePolicyOk(accountId); return { status: "unavailable", message: "Xbox reports this gamertag is no longer available.", httpStatus }; }
       if (response.status === 401 || response.status === 403) {
