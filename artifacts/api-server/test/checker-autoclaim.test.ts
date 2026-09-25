@@ -134,7 +134,30 @@ test("auto-claim OFF → hits are reported, nothing is claimed; Double Check OFF
   const statuses = Object.fromEntries(snap.results.map((r: any) => [r.gamertag, `${r.status}/${r.alertable}`]));
   assert.deepEqual(statuses, { TakenTag: "taken/false", FreeOnly: "available/true" });
   assert.equal(calls("policy").length, 0);
-  assert.equal(calls("reserve").length, 0);
+});
+
+test("Double Check OFF: the reserve probe still catches a suffix-only offer → UNKNOWN, not alertable", async () => {
+  // The suffix problem is independent of the optional Double Check toggle:
+  // a hit must never be reported as available on the strength of the
+  // primary CDN check alone without confirming Xbox will grant the exact
+  // typed name, whether or not Double Check is turned on.
+  await control(mock.url, {
+    sticky: { reserve: { status: 200, body: { classicGamertag: "NoDcTag", gamertag: "NoDcTag", gamertagSuffix: "9001" } } },
+  });
+  const { snap } = await runList(["NoDcTag"], { autoClaim: false });
+  const r = snap.results[0];
+  assert.equal(r.status, "unknown");
+  assert.equal(r.policy.status, "unavailable");
+  assert.match(r.policy.message, /#9001/);
+  assert.equal(r.alertable, false);
+  assert.equal(calls("policy").length, 0, "Double Check is off; only the reserve probe ran");
+});
+
+test("Double Check OFF: the reserve probe confirms a clean exact-name offer → still APPROVED", async () => {
+  const { snap } = await runList(["FreeOnly2"], { autoClaim: false });
+  const r = snap.results[0];
+  assert.equal(r.status, "available");
+  assert.equal(r.alertable, true);
 });
 
 test("POST /gamertag/claim: status codes and response shape (bot-compatible), no secrets", async () => {

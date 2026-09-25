@@ -312,29 +312,34 @@ async function runSearch(session: Session): Promise<void> {
           }
           if (reverify !== "available") {
             status = reverify === "taken" ? "taken" : "unknown";
-          } else if (session.runEthanPolicyCheck) {
-            // The policy endpoint may need its own 5-second 429 backoff, so it
-            // gets a fresh budget instead of inheriting the primary check's
-            // already-running 5-second timeout.
-            const policySignal = AbortSignal.any([
-              abort.signal,
-              AbortSignal.timeout(20_000),
-            ]);
-            const policyResult = await runEthanPolicyCheck(gt, policySignal, { fast: true });
-            policy = { status: policyResult.status, message: policyResult.message };
-            // An available result is only alertable after Ethan approves it.
-            // Auth, rate-limit, and network failures must not bypass the
-            // secondary check and accidentally send an unverified tag.
-            if (policyResult.status !== "approved") {
-              status = "unknown";
-            } else {
-              // The policy check answers a real but different question
-              // (content acceptability) than "will Xbox grant the exact
-              // classic name with no suffix" — a session found every one of
-              // its policy-approved hits actually needed a suffix when
-              // claimed. The reserve probe is the endpoint confirmed by real
-              // testing to carry that information; a policy approval alone
-              // is not treated as a confirmed hit without it.
+          } else {
+            if (session.runEthanPolicyCheck) {
+              // The policy endpoint may need its own 5-second 429 backoff, so it
+              // gets a fresh budget instead of inheriting the primary check's
+              // already-running 5-second timeout.
+              const policySignal = AbortSignal.any([
+                abort.signal,
+                AbortSignal.timeout(20_000),
+              ]);
+              const policyResult = await runEthanPolicyCheck(gt, policySignal, { fast: true });
+              policy = { status: policyResult.status, message: policyResult.message };
+              // An available result is only alertable after Ethan approves it.
+              // Auth, rate-limit, and network failures must not bypass the
+              // secondary check and accidentally send an unverified tag.
+              if (policyResult.status !== "approved") {
+                status = "unknown";
+              }
+            }
+            // The reserve probe answers a different question than either the
+            // primary CDN check or the optional Double Check policy check:
+            // will Xbox actually grant the EXACT typed classic gamertag, or
+            // only a suffixed variant. Neither of those checks reliably
+            // carries that info (real testing found policy-approved hits
+            // still needing a suffix), so this always runs on a surviving
+            // hit -- with or without Double Check enabled -- since without
+            // it, "available" hits showed a suffix at essentially the same
+            // rate as with Double Check on.
+            if (status === "available") {
               const probeResult = await probeGamertagReservation(gt);
               if (probeResult.status !== "available") {
                 status = "unknown";
@@ -347,7 +352,9 @@ async function runSearch(session: Session): Promise<void> {
           }
         }
         // Final alert state. Only a strict primary "available" that is either
-        // not double-checked or explicitly policy-approved is alertable.
+        // not double-checked or explicitly policy-approved is alertable. The
+        // reserve probe above already downgrades a suffix-only offer to
+        // "unknown", so a surviving "available" here has passed it too.
         alertable = status === "available" &&
           (!session.runEthanPolicyCheck || policy?.status === "approved");
       } catch {
