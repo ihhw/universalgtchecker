@@ -585,19 +585,20 @@ export async function probeGamertagReservation(
       // classicGamertag-targeted guess this used before, which appears to
       // have caused Xbox to always answer with modern-gamertag fields
       // regardless of real classic availability.
-      // Real logs show contract-version "1" (the old default here) makes
-      // Xbox reject `targetGamertagFields: "modernGamertag"` outright with
-      // HTTP 400 / code 1017 "Invalid target gamertag fields" on literally
-      // every attempt -- version 1 predates the modern-gamertag field and
-      // doesn't recognize it. The confirmed-working change/commit call
-      // below already uses version 3; use the same version here so the
-      // reserve call is validated against a contract that actually knows
-      // about `modernGamertag`.
+      // Real logs, tried in order:
+      //   contract-version "1" (old default) -> HTTP 400 code 1017
+      //     "Invalid target gamertag fields" on every attempt -- v1
+      //     predates the modernGamertag field and doesn't recognize it.
+      //   contract-version "3" (the change/commit endpoint's version) ->
+      //     HTTP 400 code 1003 "Invalid contract version" on every
+      //     attempt -- the reserve endpoint doesn't accept v3 at all.
+      // Neither 1 nor 3 is valid for THIS endpoint with a modernGamertag
+      // body; try 2, the only other plausible reserve-endpoint version.
       const reserve = await send(RESERVE_URL, ctx.authHeader, {
         modernGamertag: gamertag,
         reservationId: ctx.xuid,
         targetGamertagFields: "modernGamertag",
-      }, RESERVE_TIMEOUT_MS, { contractVersion: "3" });
+      }, RESERVE_TIMEOUT_MS, { contractVersion: "2" });
       logger.debug({ gamertag, endpoint: "reserve", status: reserve.status, body: snippet(reserve.text) }, "xbox_probe");
 
       const rs = reserve.status;
@@ -636,10 +637,10 @@ export async function probeGamertagReservation(
         // "taken" was silently mis-reporting every genuine hit as taken.
         let code: number | undefined;
         try { code = (JSON.parse(reserve.text) as { code?: number }).code; } catch { /* not JSON */ }
-        if (code === 1017) {
+        if (code === 1017 || code === 1003) {
           return {
             status: "error", httpStatus: rs,
-            message: "Xbox rejected the reservation probe's request format (code 1017) -- not a real availability answer.",
+            message: `Xbox rejected the reservation probe's request format (code ${code}) -- not a real availability answer.`,
           };
         }
         return { status: "taken", httpStatus: rs, message: "Xbox rejected this gamertag." };
