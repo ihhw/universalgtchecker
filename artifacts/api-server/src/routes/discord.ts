@@ -226,7 +226,24 @@ async function runSearch(session: Session): Promise<void> {
       let status: ResultStatus;
       try {
         status = await checkDiscordUsername(name, perCheckSignal);
-        if (status === "available" && shownAvailable.has(name)) status = "taken";
+        if (status === "available" && shownAvailable.has(name)) {
+          status = "taken";
+        } else if (status === "available") {
+          // Re-verify before treating this as a real hit. A single check
+          // can't tell a genuine hit apart from a transient false positive
+          // (a stray network hiccup, a momentarily flaky proxy) — a second
+          // check a moment later can. This only runs on an actual hit, so
+          // it costs nothing on the vast majority of checks that come back
+          // taken.
+          const reverifySignal = AbortSignal.any([abort.signal, AbortSignal.timeout(5_000)]);
+          let reverify: ResultStatus;
+          try {
+            reverify = await checkDiscordUsername(name, reverifySignal);
+          } catch {
+            reverify = "error";
+          }
+          if (reverify !== "available") status = reverify === "taken" ? "taken" : "unknown";
+        }
       } catch {
         status = "error";
       } finally {

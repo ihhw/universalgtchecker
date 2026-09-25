@@ -296,21 +296,38 @@ async function runSearch(session: Session): Promise<void> {
         status = await checkGamertag(gt, perCheckSignal);
         if (status === "available" && shownAvailable.has(gt.toUpperCase())) {
           status = "seen";
-        } else if (status === "available" && session.runEthanPolicyCheck) {
-          // The policy endpoint may need its own 5-second 429 backoff, so it
-          // gets a fresh budget instead of inheriting the primary check's
-          // already-running 5-second timeout.
-          const policySignal = AbortSignal.any([
-            abort.signal,
-            AbortSignal.timeout(20_000),
-          ]);
-          const policyResult = await runEthanPolicyCheck(gt, policySignal, { fast: true });
-          policy = { status: policyResult.status, message: policyResult.message };
-          // An available result is only alertable after Ethan approves it.
-          // Auth, rate-limit, and network failures must not bypass the
-          // secondary check and accidentally send an unverified tag.
-          if (policyResult.status !== "approved") {
-            status = "unknown";
+        } else if (status === "available") {
+          // Re-verify before treating this as a real hit. A single primary
+          // check can't tell a genuine hit apart from a transient false
+          // positive (CDN cache timing, a stray network hiccup) — a second
+          // check a moment later can. This only runs on an actual hit, so it
+          // costs nothing on the vast majority of checks that come back
+          // taken.
+          const reverifySignal = AbortSignal.any([abort.signal, AbortSignal.timeout(5_000)]);
+          let reverify: ResultStatus;
+          try {
+            reverify = await checkGamertag(gt, reverifySignal);
+          } catch {
+            reverify = "error";
+          }
+          if (reverify !== "available") {
+            status = reverify === "taken" ? "taken" : "unknown";
+          } else if (session.runEthanPolicyCheck) {
+            // The policy endpoint may need its own 5-second 429 backoff, so it
+            // gets a fresh budget instead of inheriting the primary check's
+            // already-running 5-second timeout.
+            const policySignal = AbortSignal.any([
+              abort.signal,
+              AbortSignal.timeout(20_000),
+            ]);
+            const policyResult = await runEthanPolicyCheck(gt, policySignal, { fast: true });
+            policy = { status: policyResult.status, message: policyResult.message };
+            // An available result is only alertable after Ethan approves it.
+            // Auth, rate-limit, and network failures must not bypass the
+            // secondary check and accidentally send an unverified tag.
+            if (policyResult.status !== "approved") {
+              status = "unknown";
+            }
           }
         }
         // Final alert state. Only a strict primary "available" that is either
