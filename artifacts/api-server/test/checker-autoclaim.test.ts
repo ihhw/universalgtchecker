@@ -92,6 +92,43 @@ test("Double Check 200 with no suffix and a matching name → still APPROVED (no
   assert.equal(r.alertable, true);
 });
 
+test("Double Check approves but the reserve probe finds a suffix-only offer → UNKNOWN, not alertable, never claimed", async () => {
+  // The policy endpoint (user.mgt.xboxlive.com) approves cleanly with no
+  // suffix info at all — matching what real testing showed: it answers
+  // content-policy acceptability, not gamertag-suffix allocation. The
+  // reserve probe (gamertag.xboxlive.com, the endpoint confirmed accurate
+  // by real claim testing) is the one that reveals the exact name is only
+  // offered with a suffix attached.
+  await control(mock.url, {
+    sticky: {
+      policy: { status: 200, body: {} },
+      reserve: { status: 200, body: { classicGamertag: "ProbeTag", gamertag: "ProbeTag", gamertagSuffix: "7712" } },
+    },
+  });
+  const { snap } = await runList(["ProbeTag"], { runEthanPolicyCheck: true, autoClaim: true });
+  const r = snap.results[0];
+  assert.equal(r.status, "unknown");
+  assert.equal(r.policy.status, "unavailable");
+  assert.match(r.policy.message, /#7712/);
+  assert.equal(r.alertable, false);
+  await new Promise((res) => setTimeout(res, 200));
+  assert.equal(calls("change").length, 0, "never attempts a claim on a name Xbox would only offer with a suffix");
+});
+
+test("Double Check approves and the reserve probe confirms the exact name → still APPROVED (no false regression)", async () => {
+  await control(mock.url, {
+    sticky: {
+      policy: { status: 200, body: {} },
+      reserve: { status: 200, body: { classicGamertag: "ProbeCleanTag", gamertag: "ProbeCleanTag", gamertagSuffix: "" } },
+    },
+  });
+  const { snap } = await runList(["ProbeCleanTag"], { runEthanPolicyCheck: true });
+  const r = snap.results[0];
+  assert.equal(r.status, "available");
+  assert.equal(r.policy.status, "approved");
+  assert.equal(r.alertable, true);
+});
+
 test("auto-claim OFF → hits are reported, nothing is claimed; Double Check OFF classification unchanged", async () => {
   const { snap } = await runList(["TakenTag", "FreeOnly"], { autoClaim: false });
   const statuses = Object.fromEntries(snap.results.map((r: any) => [r.gamertag, `${r.status}/${r.alertable}`]));

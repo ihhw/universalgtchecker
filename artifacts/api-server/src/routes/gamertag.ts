@@ -17,7 +17,7 @@ import {
   checkGamertag, checkViaAvailabilityEndpoint, checkViaCDN, runEthanPolicyCheck,
   type PolicyStatus, type ResultStatus,
 } from "../lib/xbox-availability";
-import { claimGamertag, listClaims, notifyClaimWebhook, type ClaimRecord } from "../lib/xbox-claim";
+import { claimGamertag, listClaims, notifyClaimWebhook, probeGamertagReservation, type ClaimRecord } from "../lib/xbox-claim";
 import { compileGeneration, type Generator } from "../lib/gamertag-generator";
 import { validateXboxGamertag } from "../lib/xbox-validation";
 import { pushActivity } from "../lib/activity";
@@ -327,6 +327,22 @@ async function runSearch(session: Session): Promise<void> {
             // secondary check and accidentally send an unverified tag.
             if (policyResult.status !== "approved") {
               status = "unknown";
+            } else {
+              // The policy check answers a real but different question
+              // (content acceptability) than "will Xbox grant the exact
+              // classic name with no suffix" — a session found every one of
+              // its policy-approved hits actually needed a suffix when
+              // claimed. The reserve probe is the endpoint confirmed by real
+              // testing to carry that information; a policy approval alone
+              // is not treated as a confirmed hit without it.
+              const probeResult = await probeGamertagReservation(gt);
+              if (probeResult.status !== "available") {
+                status = "unknown";
+                policy = {
+                  status: "unavailable",
+                  message: probeResult.message ?? "Xbox would only reserve this gamertag with a suffix attached.",
+                };
+              }
             }
           }
         }

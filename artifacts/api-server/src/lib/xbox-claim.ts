@@ -291,6 +291,93 @@ async function send(
   return { status: res.status, headers: res.headers, text };
 }
 
+// ─── Reservation probe ──────────────────────────────────────────────────────
+//
+// A non-destructive availability check that reuses the exact same reserve
+// call claimGamertag() makes as its own first step (never the change step,
+// so nothing is ever renamed) — because it's the only endpoint CONFIRMED by
+// real live testing to carry accurate information about whether Xbox will
+// grant the exact typed classic gamertag or only a suffixed one.
+//
+// This exists because the separate Double Check policy endpoint
+// (user.mgt.xboxlive.com, in xbox-availability.ts) turned out NOT to
+// reliably signal this: a checker session found every one of its "Double
+// Check approved" hits actually required a suffix when an exact claim was
+// attempted. That endpoint answers a real but different question — content
+// policy acceptability — not gamertag-suffix allocation.
+
+export type ReservationProbeStatus =
+  | "available" | "taken" | "suffix_required" | "auth_required" | "rate_limited" | "error";
+
+export interface ReservationProbeResult {
+  status: ReservationProbeStatus;
+  message?: string;
+  httpStatus?: number;
+}
+
+export async function probeGamertagReservation(
+  gamertag: string,
+  accountId?: AccountSelection,
+): Promise<ReservationProbeResult> {
+  const selection = selectAccountForClaim(accountId);
+  if (!selection.ok) {
+    return { status: selection.kind === "busy" ? "error" : "auth_required", message: selection.reason };
+  }
+  const id = selection.accountId;
+  // Never probe an account mid a real claim — a probe's own reserve call
+  // could otherwise land in between that claim's reserve and change steps.
+  if (claimInProgress(id)) {
+    return { status: "error", message: "This account has a claim in progress; skipped the probe." };
+  }
+
+  const ctx = await getClaimContext(id);
+  if (!ctx.ok) return { status: "auth_required", message: ctx.reason };
+
+  try {
+    const reserve = await send(RESERVE_URL, ctx.authHeader, {
+      classicGamertag: gamertag,
+      reservationId: ctx.xuid,
+      targetGamertagFields: "classicGamertag",
+    }, RESERVE_TIMEOUT_MS);
+
+    const rs = reserve.status;
+    if (rs === 429) {
+      return { status: "rate_limited", httpStatus: rs, message: "Xbox rate-limited the reservation probe." };
+    }
+    if (rs === 401 || rs === 403) {
+      return { status: "auth_required", httpStatus: rs, message: "Xbox rejected this account's authorization for the reservation probe." };
+    }
+    if (rs === 409) {
+      return { status: "taken", httpStatus: rs, message: "Xbox reports this gamertag is taken or reserved by someone else." };
+    }
+    if (rs === 400) {
+      return { status: "taken", httpStatus: rs, message: "Xbox rejected this gamertag." };
+    }
+    if (rs !== 200 && rs !== 201 && rs !== 204) {
+      return { status: "error", httpStatus: rs, message: `Unexpected reservation probe response HTTP ${rs}.` };
+    }
+
+    try {
+      const r = JSON.parse(reserve.text) as { classicGamertag?: string; gamertag?: string; gamertagSuffix?: string };
+      const reserved = r.classicGamertag ?? r.gamertag;
+      if ((r.gamertagSuffix && r.gamertagSuffix.trim()) || (reserved && !sameTag(reserved, gamertag))) {
+        return {
+          status: "suffix_required",
+          httpStatus: rs,
+          message: `Xbox would only reserve "${reserved ?? gamertag}${r.gamertagSuffix ? `#${r.gamertagSuffix}` : ""}", not the exact "${gamertag}".`,
+        };
+      }
+    } catch { /* empty/non-JSON body: the status code is the confirmation */ }
+    return { status: "available", httpStatus: rs };
+  } catch (err) {
+    const kind = errorKind(err);
+    return {
+      status: "error",
+      message: kind === "timeout" ? "The reservation probe timed out." : "Could not reach Xbox for the reservation probe.",
+    };
+  }
+}
+
 // ─── Claim ────────────────────────────────────────────────────────────────────
 
 export async function claimGamertag(
