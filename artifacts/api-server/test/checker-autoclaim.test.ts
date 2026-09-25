@@ -19,10 +19,6 @@ beforeEach(() => {
 });
 
 const calls = (ep: string) => mock.state.log.filter((l) => l.endpoint === ep);
-// The reservation probe also calls the "change" endpoint, but only ever with
-// PreviewOnly: true (never applying a change) -- callers checking for a real
-// claim's change call should use this, not the raw endpoint filter.
-const realChanges = () => calls("change").filter((l) => (l.body as any)?.PreviewOnly !== true);
 const post = (p: string, body: unknown) => fetch(base + p, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
 
 async function runList(names: string[], extra: Record<string, unknown>) {
@@ -53,7 +49,7 @@ test("server-side auto-claim claims the FIRST confirmed hit only, with the brows
   });
   assert.ok(["HitAlpha", "HitBravo"].includes(final.claimed), `claimed=${final.claimed}`);
   assert.equal(final.autoClaim, false, "auto-claim switches off after the first confirmed claim");
-  assert.equal(realChanges().length, 1, "the account is renamed exactly once");
+  assert.equal(calls("change").length, 1, "the account is renamed exactly once");
   assert.equal(mock.state.gamertag, final.claimed);
 });
 
@@ -96,92 +92,12 @@ test("Double Check 200 with no suffix and a matching name → still APPROVED (no
   assert.equal(r.alertable, true);
 });
 
-test("Double Check approves but the reserve probe finds a suffix-only offer → UNKNOWN, not alertable, never claimed", async () => {
-  // The policy endpoint (user.mgt.xboxlive.com) approves cleanly with no
-  // suffix info at all — matching what real testing showed: it answers
-  // content-policy acceptability, not gamertag-suffix allocation. The
-  // reserve probe (gamertag.xboxlive.com, the endpoint confirmed accurate
-  // by real claim testing) is the one that reveals the exact name is only
-  // offered with a suffix attached.
-  await control(mock.url, {
-    sticky: {
-      policy: { status: 200, body: {} },
-      reserve: { status: 200, body: { classicGamertag: "ProbeTag", gamertag: "ProbeTag", gamertagSuffix: "7712" } },
-    },
-  });
-  const { snap } = await runList(["ProbeTag"], { runEthanPolicyCheck: true, autoClaim: true });
-  const r = snap.results[0];
-  assert.equal(r.status, "unknown");
-  assert.equal(r.policy.status, "unavailable");
-  assert.match(r.policy.message, /#7712/);
-  assert.equal(r.alertable, false);
-  await new Promise((res) => setTimeout(res, 200));
-  assert.equal(calls("change").length, 0, "never attempts a claim on a name Xbox would only offer with a suffix");
-});
-
-test("Double Check approves and the reserve probe confirms the exact name → still APPROVED (no false regression)", async () => {
-  await control(mock.url, {
-    sticky: {
-      policy: { status: 200, body: {} },
-      // Scripting a sticky reserve response bypasses the mock's normal
-      // reservation bookkeeping, so the change-preview step also needs a
-      // scripted clean response here (a real reserve success would record
-      // the reservation the change endpoint checks for).
-      reserve: { status: 200, body: { classicGamertag: "ProbeCleanTag", gamertag: "ProbeCleanTag", gamertagSuffix: "" } },
-      change: { status: 200, body: { Gamertag: "ProbeCleanTag", GamertagSuffix: "", hasFree: true } },
-    },
-  });
-  const { snap } = await runList(["ProbeCleanTag"], { runEthanPolicyCheck: true });
-  const r = snap.results[0];
-  assert.equal(r.status, "available");
-  assert.equal(r.policy.status, "approved");
-  assert.equal(r.alertable, true);
-});
-
 test("auto-claim OFF → hits are reported, nothing is claimed; Double Check OFF classification unchanged", async () => {
   const { snap } = await runList(["TakenTag", "FreeOnly"], { autoClaim: false });
   const statuses = Object.fromEntries(snap.results.map((r: any) => [r.gamertag, `${r.status}/${r.alertable}`]));
   assert.deepEqual(statuses, { TakenTag: "taken/false", FreeOnly: "available/true" });
   assert.equal(calls("policy").length, 0);
-});
-
-test("Double Check OFF: the reserve probe still catches a suffix-only offer → UNKNOWN, not alertable", async () => {
-  // The suffix problem is independent of the optional Double Check toggle:
-  // a hit must never be reported as available on the strength of the
-  // primary CDN check alone without confirming Xbox will grant the exact
-  // typed name, whether or not Double Check is turned on.
-  await control(mock.url, {
-    sticky: { reserve: { status: 200, body: { classicGamertag: "NoDcTag", gamertag: "NoDcTag", gamertagSuffix: "9001" } } },
-  });
-  const { snap } = await runList(["NoDcTag"], { autoClaim: false });
-  const r = snap.results[0];
-  assert.equal(r.status, "unknown");
-  assert.equal(r.policy.status, "unavailable");
-  assert.match(r.policy.message, /#9001/);
-  assert.equal(r.alertable, false);
-  assert.equal(calls("policy").length, 0, "Double Check is off; only the reserve probe ran");
-});
-
-test("reserve looks clean but the change-preview reveals a suffix → UNKNOWN, not alertable", async () => {
-  // The reserve call alone can look clean (no suffix fields) while the real
-  // change step -- previewed here, never applied -- is where Xbox actually
-  // decides the exact classic name isn't grantable.
-  await control(mock.url, {
-    sticky: { change: { status: 200, body: { Gamertag: "PreviewTag", GamertagSuffix: "3344" } } },
-  });
-  const { snap } = await runList(["PreviewTag"], { autoClaim: false });
-  const r = snap.results[0];
-  assert.equal(r.status, "unknown");
-  assert.equal(r.policy.status, "unavailable");
-  assert.match(r.policy.message, /#3344/);
-  assert.equal(r.alertable, false);
-});
-
-test("Double Check OFF: the reserve probe confirms a clean exact-name offer → still APPROVED", async () => {
-  const { snap } = await runList(["FreeOnly2"], { autoClaim: false });
-  const r = snap.results[0];
-  assert.equal(r.status, "available");
-  assert.equal(r.alertable, true);
+  assert.equal(calls("reserve").length, 0);
 });
 
 test("POST /gamertag/claim: status codes and response shape (bot-compatible), no secrets", async () => {

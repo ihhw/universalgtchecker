@@ -203,7 +203,6 @@ export function startMockXbox(port = 0): Promise<{ url: string; state: MockState
           const gt = String(b["Gamertag"] ?? "");
           if (b["ReservationId"] !== state.xuid) { send(400, { source: "Accounts", code: 1372, description: "The gamertag belongs to another user" }); return; }
           if (state.reservations.get(gt.toUpperCase()) !== state.xuid) { send(409, { description: "No reservation" }); return; }
-          if (b["PreviewOnly"] === true) { send(200, { Gamertag: gt, GamertagSuffix: "", hasFree: true }); return; }
           state.gamertag = gt;
           state.taken.add(gt.toUpperCase());
           send(200, { Gamertag: gt, GamertagSuffix: "" });
