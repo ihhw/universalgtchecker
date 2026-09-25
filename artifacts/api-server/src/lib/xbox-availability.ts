@@ -12,7 +12,7 @@
 
 import { logger } from "./logger";
 import { isBlockedByContentFilter } from "./content-filter";
-import { getAuthHeader, getXuid } from "./xbox-auth";
+import { getAccountInfoList, getClaimContext } from "./xbox-auth";
 import { fastFetch, retryAfterMs, xboxUrl } from "./xbox-http";
 
 export type ResultStatus = "available" | "taken" | "inappropriate" | "seen" | "unknown" | "error";
@@ -38,27 +38,43 @@ export interface PolicyResult {
 const ETHAN_POLICY_URL = "https://user.mgt.xboxlive.com/gamertags/reserve";
 
 /**
- * Spacing between Double Check requests. This endpoint is tied to one
- * authenticated account's XSTS token — unlike the Discord checker's proxy
- * pool, there's no separate IP identity to spread load across, so the only
- * safe lever is how fast this one account's requests go out.
+ * Spacing between Double Check requests, tracked per Xbox account. This
+ * endpoint is tied to one account's XSTS token, so — unlike the Discord
+ * checker's proxy pool — the way to raise the ceiling is connecting more
+ * Xbox accounts (Settings → Connect Xbox → "Add another") rather than
+ * finding more IPs; requests then round-robin across every connected,
+ * ready account instead of all queuing behind one account's budget.
  *
- * The 350ms floor is a starting guess, not a known-correct number. Rather
- * than stay pinned to it (which either wastes headroom Xbox would actually
- * allow, or — the reported problem — keeps re-triggering a limit that's
- * actually tighter than 350ms), the spacing adapts: a 429's own Retry-After
- * raises it immediately so the *next* request waits long enough the first
- * time, and a run of clean responses relaxes it back down in steps, so a
- * temporary tightening doesn't permanently slow later requests once Xbox
- * is calm again.
+ * The 350ms floor is a starting guess per account, not a known-correct
+ * number. Rather than stay pinned to it (which either wastes headroom Xbox
+ * would actually allow, or keeps re-triggering a limit that's actually
+ * tighter than 350ms), each account's spacing adapts independently: a 429's
+ * own Retry-After raises that account's floor immediately so its *next*
+ * request waits long enough the first time, and a run of clean responses on
+ * that account relaxes it back down in steps — so one account tightening up
+ * doesn't slow the others, and doesn't stay slow once Xbox calms down.
  */
 const POLICY_SPACING_FLOOR_MS = 350;
 const POLICY_SPACING_CAP_MS = 8_000;
 const POLICY_RELAX_AFTER_OK = 5;
-let policySpacingMs = POLICY_SPACING_FLOOR_MS;
-let policyConsecutiveOk = 0;
-let lastPolicyRequestAt = 0;
-let policyRequestQueue = Promise.resolve();
+
+interface AccountPolicyState {
+  spacingMs: number;
+  consecutiveOk: number;
+  lastRequestAt: number;
+  queue: Promise<void>;
+}
+const policyStateByAccount = new Map<string, AccountPolicyState>();
+let accountCursor = 0;
+
+function policyStateFor(accountId: string): AccountPolicyState {
+  let state = policyStateByAccount.get(accountId);
+  if (!state) {
+    state = { spacingMs: POLICY_SPACING_FLOOR_MS, consecutiveOk: 0, lastRequestAt: 0, queue: Promise.resolve() };
+    policyStateByAccount.set(accountId, state);
+  }
+  return state;
+}
 
 export function wait(ms: number, signal: AbortSignal): Promise<void> {
   return new Promise<void>((resolve) => {
@@ -68,66 +84,121 @@ export function wait(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
-function getReservationId(): string | null {
-  // Xbox's reserve API accepts the signed-in account's XUID as the
-  // reservationId. The explicit env value remains available for accounts or
-  // legacy flows that provide a different reservation identifier.
-  const configured = process.env.XBOX_RESERVATION_ID?.trim();
-  return configured || getXuid();
+/** A 429 raises this account's spacing floor to at least what Xbox itself asked for. */
+function raisePolicySpacing(accountId: string, ms: number): void {
+  const state = policyStateFor(accountId);
+  state.spacingMs = Math.min(POLICY_SPACING_CAP_MS, Math.max(state.spacingMs, ms));
+  state.consecutiveOk = 0;
 }
 
-/** A 429 raises the spacing floor to at least what Xbox itself asked for. */
-function raisePolicySpacing(ms: number): void {
-  policySpacingMs = Math.min(POLICY_SPACING_CAP_MS, Math.max(policySpacingMs, ms));
-  policyConsecutiveOk = 0;
-}
-
-/** A streak of decisive (non-429) responses steps the spacing back toward the floor. */
-function notePolicyOk(): void {
-  if (policySpacingMs <= POLICY_SPACING_FLOOR_MS) return;
-  policyConsecutiveOk++;
-  if (policyConsecutiveOk >= POLICY_RELAX_AFTER_OK) {
-    policySpacingMs = Math.max(POLICY_SPACING_FLOOR_MS, Math.round(policySpacingMs * 0.7));
-    policyConsecutiveOk = 0;
+/** A streak of decisive (non-429) responses on this account steps its spacing back toward the floor. */
+function notePolicyOk(accountId: string): void {
+  const state = policyStateFor(accountId);
+  if (state.spacingMs <= POLICY_SPACING_FLOOR_MS) return;
+  state.consecutiveOk++;
+  if (state.consecutiveOk >= POLICY_RELAX_AFTER_OK) {
+    state.spacingMs = Math.max(POLICY_SPACING_FLOOR_MS, Math.round(state.spacingMs * 0.7));
+    state.consecutiveOk = 0;
   }
 }
 
-function waitForPolicyRequestSlot(signal: AbortSignal): Promise<void> {
-  const acquire = policyRequestQueue.then(async () => {
-    const delay = Math.max(0, policySpacingMs - (Date.now() - lastPolicyRequestAt));
+function waitForPolicyRequestSlot(accountId: string, signal: AbortSignal): Promise<void> {
+  const state = policyStateFor(accountId);
+  const acquire = state.queue.then(async () => {
+    const delay = Math.max(0, state.spacingMs - (Date.now() - state.lastRequestAt));
     if (delay > 0) await wait(delay, signal);
-    if (!signal.aborted) lastPolicyRequestAt = Date.now();
+    if (!signal.aborted) state.lastRequestAt = Date.now();
   });
-  policyRequestQueue = acquire.catch(() => undefined);
+  state.queue = acquire.catch(() => undefined);
   return acquire;
 }
 
 /**
- * Double Check. `opts.retryOn429` keeps the checker's original behaviour (one
- * retry, waiting whatever Xbox's own Retry-After says); the sniper passes
- * false and applies its own backoff. `opts.fast` routes the request through
- * the keep-alive agent.
+ * Per-account cooldown after repeated auth failures, so one broken account
+ * (revoked refresh token, etc.) doesn't eat an equal share of every
+ * round-robin turn forever — mirrors the Discord checker's per-proxy
+ * cooldown. Deliberately *not* a precondition on picking an account (no
+ * "must already have a valid cached token" filter): a freshly connected
+ * account has no cached XSTS token yet — that's exactly what
+ * getClaimContext(accountId) mints on first use — so gating on it here
+ * would mean a brand-new account could never be picked long enough to ever
+ * become ready.
+ */
+interface AccountHealth { deadUntil: number; consecutiveAuthFail: number }
+const accountHealth = new Map<string, AccountHealth>();
+const ACCOUNT_AUTH_FAIL_STRIKES = 2;
+const ACCOUNT_AUTH_FAIL_COOLDOWN_MS = 30_000;
+
+function markAccountAuthFail(accountId: string): void {
+  const health = accountHealth.get(accountId) ?? { deadUntil: 0, consecutiveAuthFail: 0 };
+  health.consecutiveAuthFail++;
+  if (health.consecutiveAuthFail >= ACCOUNT_AUTH_FAIL_STRIKES) {
+    health.deadUntil = Date.now() + ACCOUNT_AUTH_FAIL_COOLDOWN_MS;
+    health.consecutiveAuthFail = 0;
+  }
+  accountHealth.set(accountId, health);
+}
+function markAccountAuthOk(accountId: string): void {
+  accountHealth.set(accountId, { deadUntil: 0, consecutiveAuthFail: 0 });
+}
+
+/**
+ * Round-robins across every connected Xbox account, skipping ones currently
+ * in an auth-failure cooldown. With one account connected (today's common
+ * case) this always returns that same account — identical behaviour to
+ * before accounts were poolable. With several, load spreads across them the
+ * same way the Discord checker spreads across proxies.
+ */
+function pickPolicyAccount(): string | null {
+  const all = getAccountInfoList();
+  if (all.length === 0) return null;
+  const now = Date.now();
+  for (let i = 0; i < all.length; i++) {
+    const idx = (accountCursor + i) % all.length;
+    const candidate = all[idx]!;
+    const health = accountHealth.get(candidate.id);
+    if (!health || health.deadUntil <= now) {
+      accountCursor = idx + 1;
+      return candidate.id;
+    }
+  }
+  // Every account is cooling down: use one anyway rather than stalling entirely.
+  const candidate = all[accountCursor % all.length]!;
+  accountCursor++;
+  return candidate.id;
+}
+
+/**
+ * Double Check. `opts.accountId` pins a specific account; omitted, one is
+ * chosen by round-robin across every connected, ready account. `opts.retryOn429`
+ * keeps the checker's original behaviour (one retry, waiting whatever Xbox's
+ * own Retry-After says); the sniper passes false and applies its own backoff.
+ * `opts.fast` routes the request through the keep-alive agent.
  */
 export async function runEthanPolicyCheck(
   gamertag: string,
   signal: AbortSignal,
-  opts: { retryOn429?: boolean; fast?: boolean } = {},
+  opts: { retryOn429?: boolean; fast?: boolean; accountId?: string } = {},
 ): Promise<PolicyResult> {
   const retryOn429 = opts.retryOn429 ?? true;
-  const authHeader = await getAuthHeader();
-  if (!authHeader) return { status: "auth_required", message: "Sign in to Xbox to run the secondary policy check." };
+  const accountId = opts.accountId ?? pickPolicyAccount();
+  if (!accountId) return { status: "auth_required", message: "Sign in to Xbox to run the secondary policy check." };
 
-  const reservationId = getReservationId();
-  if (!reservationId) {
-    return {
-      status: "not_configured",
-      message: "The server is missing XBOX_RESERVATION_ID.",
-    };
+  const ctx = await getClaimContext(accountId);
+  if (!ctx.ok) {
+    markAccountAuthFail(accountId);
+    return { status: "auth_required", message: ctx.reason };
   }
+  markAccountAuthOk(accountId);
+  const authHeader = ctx.authHeader;
+  // Xbox's reserve API accepts the account's XUID as the reservationId. The
+  // explicit env value remains available for accounts or legacy flows that
+  // provide a different reservation identifier.
+  const reservationId = process.env.XBOX_RESERVATION_ID?.trim() || ctx.xuid;
 
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      await waitForPolicyRequestSlot(signal);
+      await waitForPolicyRequestSlot(accountId, signal);
       const init = {
         method: "POST",
         signal,
@@ -145,17 +216,17 @@ export async function runEthanPolicyCheck(
       if (opts.fast) void response.text().catch(() => undefined);
       const httpStatus = response.status;
 
-      if (response.status === 200) { notePolicyOk(); return { status: "approved", httpStatus }; }
-      if (response.status === 400) { notePolicyOk(); return { status: "banned", message: "Xbox marked this gamertag as unacceptable.", httpStatus }; }
-      if (response.status === 409) { notePolicyOk(); return { status: "unavailable", message: "Xbox reports this gamertag is no longer available.", httpStatus }; }
+      if (response.status === 200) { notePolicyOk(accountId); return { status: "approved", httpStatus }; }
+      if (response.status === 400) { notePolicyOk(accountId); return { status: "banned", message: "Xbox marked this gamertag as unacceptable.", httpStatus }; }
+      if (response.status === 409) { notePolicyOk(accountId); return { status: "unavailable", message: "Xbox reports this gamertag is no longer available.", httpStatus }; }
       if (response.status === 401 || response.status === 403) {
         return { status: "auth_required", message: "The Xbox authorization token was rejected.", httpStatus };
       }
       if (response.status === 429) {
         const backoffMs = retryAfterMs(response.headers as Headers, attempt === 0 ? 2_000 : 5_000);
-        raisePolicySpacing(backoffMs);
+        raisePolicySpacing(accountId, backoffMs);
         if (attempt === 0 && retryOn429) {
-          logger.warn({ gamertag, backoffMs }, "Ethan policy check rate-limited; retrying");
+          logger.warn({ gamertag, accountId, backoffMs }, "Ethan policy check rate-limited; retrying");
           await wait(backoffMs, signal);
           continue;
         }
@@ -167,11 +238,11 @@ export async function runEthanPolicyCheck(
         };
       }
 
-      logger.warn({ gamertag, status: response.status }, "Unexpected Ethan policy check response");
+      logger.warn({ gamertag, accountId, status: response.status }, "Unexpected Ethan policy check response");
       return { status: "error", message: `Xbox returned HTTP ${response.status}.`, httpStatus };
     } catch (err) {
       if (signal.aborted) return { status: "error", message: "Secondary policy check cancelled." };
-      logger.warn({ gamertag, errName: err instanceof Error ? err.name : "unknown" }, "Ethan policy check request failed");
+      logger.warn({ gamertag, accountId, errName: err instanceof Error ? err.name : "unknown" }, "Ethan policy check request failed");
       return { status: "error", message: "Secondary policy check failed." };
     }
   }
