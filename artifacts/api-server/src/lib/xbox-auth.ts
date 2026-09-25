@@ -63,14 +63,17 @@ export interface Readiness {
 }
 
 export interface AccountInfo {
-  id:          string;
-  xuid:        string | null;
-  gamertag:    string | null;
-  maskedEmail: string | null;
-  addedAt:     number;  // epoch ms
-  isActive:    boolean;
-  xstsReady:   boolean;
-  readiness:   Readiness;
+  id:               string;
+  xuid:             string | null;
+  gamertag:         string | null;
+  maskedEmail:      string | null;
+  addedAt:          number;  // epoch ms
+  isActive:         boolean;
+  xstsReady:        boolean;
+  readiness:        Readiness;
+  /** Set while Xbox has rate-limited this account; it is suspended from search/claims until this time. */
+  rateLimitedUntil: number | null;
+  rateLimitReason:  string | null;
 }
 
 interface AccountState {
@@ -91,6 +94,9 @@ interface AccountState {
   xstsExpiry:      number;
   uhs:             string | null;
   readiness:       Readiness;
+  /** Set while Xbox has rate-limited this account; cleared once it elapses. */
+  rateLimitedUntil: number | null;
+  rateLimitReason:  string | null;
 }
 
 // ─── In-memory store ──────────────────────────────────────────────────────────
@@ -219,6 +225,7 @@ function makeAccount(
     xblToken: null, xblExpiry: 0,
     xstsToken: null, xstsExpiry: 0, uhs: null,
     readiness: { ...NOT_CHECKED },
+    rateLimitedUntil: null, rateLimitReason: null,
   };
 }
 
@@ -614,15 +621,44 @@ export function getDeviceCodeState(): DeviceCodeInfo | null { return dcState; }
 
 export function getAccountInfoList(): AccountInfo[] {
   return [...accounts.values()].map((a) => ({
-    id:          a.id,
-    xuid:        a.xuid,
-    gamertag:    a.gamertag,
-    maskedEmail: a.maskedEmail,
-    addedAt:     a.addedAt,
-    isActive:    a.id === activeAccountId,
-    xstsReady:   xstsValid(a),
-    readiness:   a.readiness,
+    id:               a.id,
+    xuid:             a.xuid,
+    gamertag:         a.gamertag,
+    maskedEmail:      a.maskedEmail,
+    addedAt:          a.addedAt,
+    isActive:         a.id === activeAccountId,
+    xstsReady:        xstsValid(a),
+    readiness:        a.readiness,
+    rateLimitedUntil: isAccountRateLimited(a.id) ? a.rateLimitedUntil : null,
+    rateLimitReason:  isAccountRateLimited(a.id) ? a.rateLimitReason : null,
   }));
+}
+
+/**
+ * Marks an account as rate-limited by Xbox: suspended from search/claim
+ * account selection until `untilMs` (epoch ms). Callers should describe the
+ * concrete limit hit (e.g. "300 requests / 6h reserve cap") in `reason` so
+ * the UI can explain why the account is unusable right now.
+ */
+export function markAccountRateLimited(id: string, untilMs: number, reason: string): void {
+  const account = accounts.get(id);
+  if (!account) return;
+  account.rateLimitedUntil = untilMs;
+  account.rateLimitReason = reason;
+  logger.warn({ accountId: id, untilMs, reason }, "Xbox account rate-limited — suspended from search/claims");
+  logAudit("ACCOUNT_RATE_LIMITED", { accountId: id, reason });
+}
+
+/** True while the account's rate-limit window hasn't elapsed yet. Auto-clears once it has. */
+export function isAccountRateLimited(id: string): boolean {
+  const account = accounts.get(id);
+  if (!account?.rateLimitedUntil) return false;
+  if (Date.now() >= account.rateLimitedUntil) {
+    account.rateLimitedUntil = null;
+    account.rateLimitReason = null;
+    return false;
+  }
+  return true;
 }
 
 export function removeAccount(id: string): boolean {
@@ -684,6 +720,9 @@ export async function getClaimContext(accountId?: string): Promise<ClaimContext>
   }
   const account = accounts.get(id);
   if (!account) return { ok: false, stage: "none", reason: "No Xbox account connected. Connect Xbox first.", code: null };
+  if (isAccountRateLimited(id)) {
+    return { ok: false, stage: account.readiness.stage, reason: account.rateLimitReason ?? "This account is rate-limited by Xbox and not usable right now.", code: null };
+  }
   const xsts = await fetchXstsForAccount(id);
   if (!xsts) {
     return {

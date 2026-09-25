@@ -45,7 +45,7 @@ import fs from "fs";
 import path from "path";
 import { logger } from "./logger";
 import { validateXboxGamertag } from "./xbox-validation";
-import { getClaimContext, refreshActiveIdentity, getActiveAccountId, getAccountInfoList } from "./xbox-auth";
+import { getClaimContext, refreshActiveIdentity, getActiveAccountId, getAccountInfoList, markAccountRateLimited, isAccountRateLimited } from "./xbox-auth";
 import { fastFetch, retryAfterMs, warmConnection } from "./xbox-http";
 import { getWebhookTarget, sendWebhookPayload } from "./webhook-store";
 import { recordClaim } from "./stats";
@@ -283,7 +283,7 @@ export function claimInProgress(accountId: string): string | null { return busy.
  */
 let probeAccountCursor = 0;
 function pickProbeAccount(): string | null {
-  const all = getAccountInfoList();
+  const all = getAccountInfoList().filter((a) => !isAccountRateLimited(a.id));
   if (all.length === 0) return null;
   for (let i = 0; i < all.length; i++) {
     const idx = (probeAccountCursor + i) % all.length;
@@ -325,6 +325,9 @@ export function selectAccountForClaim(requested?: AccountSelection): { ok: true;
         reason: `A claim for "${busy.get(acct.id)}" is already in progress on this account. Only one claim per account runs at a time.`,
       };
     }
+    if (isAccountRateLimited(acct.id)) {
+      return { ok: false, kind: "no_account", reason: acct.rateLimitReason ?? "This account is rate-limited by Xbox and not usable right now." };
+    }
     // Readiness isn't re-checked here: the cached flag can be stale (e.g.
     // right after a restart, before the first live check), and
     // getClaimContext() immediately after this always re-verifies live and
@@ -332,16 +335,17 @@ export function selectAccountForClaim(requested?: AccountSelection): { ok: true;
     return { ok: true, accountId: acct.id };
   }
 
-  // Automatic: never pick a busy account. Prefer one already confirmed
-  // READY; fall back to an unverified one only when none is — the live
-  // check right after this is still the real, fail-closed source of truth.
-  const free = accounts.filter((a) => !busy.has(a.id));
+  // Automatic: never pick a busy or rate-limited account. Prefer one
+  // already confirmed READY; fall back to an unverified one only when none
+  // is — the live check right after this is still the real, fail-closed
+  // source of truth.
+  const free = accounts.filter((a) => !busy.has(a.id) && !isAccountRateLimited(a.id));
   if (free.length === 0) {
     const anyBusyGamertag = [...busy.values()][0];
-    return {
-      ok: false, kind: "busy",
-      reason: `A claim for "${anyBusyGamertag}" is already in progress. Only one claim runs at a time per account, and every connected account is currently claiming.`,
-    };
+    const reason = anyBusyGamertag
+      ? `A claim for "${anyBusyGamertag}" is already in progress. Only one claim runs at a time per account, and every connected account is currently claiming or rate-limited.`
+      : "Every connected Xbox account is currently rate-limited and suspended from claiming.";
+    return { ok: false, kind: "busy", reason };
   }
   // Prefer the active account whenever it's free, exactly like the
   // single-account app always behaved — even if it hasn't been live-checked
@@ -364,6 +368,36 @@ const ms = (from: number) => Math.round(now() - from);
 function snippet(body: string): string | null {
   const t = body.trim();
   return t ? t.slice(0, 300) : null;
+}
+
+/**
+ * Default suspension window applied when Xbox's 429 doesn't tell us how
+ * long the limit lasts. Xbox enforces several rate tiers concurrently (seen
+ * live: 10/60s, 50/300s, 300/21600s); the account can look free again on a
+ * short tier while it's still deep in the 6h one, so falling back to the
+ * longest known tier is the only way to avoid re-hammering an account
+ * that's actually still capped.
+ */
+const RATE_LIMIT_DEFAULT_MS = 6 * 60 * 60 * 1000;
+
+/** Suspends an account after a 429: marks it rate-limited and unusable for search/claims. */
+function suspendAccountForRateLimit(accountId: string, res: { headers: Headers; text: string }, what: string): void {
+  let windowMs = RATE_LIMIT_DEFAULT_MS;
+  let description = `Xbox rate-limited this account (HTTP 429) while ${what}.`;
+  try {
+    const body = JSON.parse(res.text) as { periodInSeconds?: number; maxRequests?: number; limitType?: string };
+    if (typeof body.periodInSeconds === "number" && body.periodInSeconds > 0) {
+      windowMs = body.periodInSeconds * 1000;
+    }
+    if (body.limitType || body.maxRequests) {
+      description = `Xbox rate-limited this account (HTTP 429${body.limitType ? `, ${body.limitType}` : ""}${
+        body.maxRequests ? `, ${body.maxRequests}/${body.periodInSeconds ?? "?"}s` : ""
+      }) while ${what}. Not usable right now.`;
+    }
+  } catch { /* not JSON — fall back to the default window */ }
+  const headerMs = retryAfterMs(res.headers, 0, 24 * 60 * 60 * 1000);
+  const untilMs = Date.now() + Math.max(windowMs, headerMs);
+  markAccountRateLimited(accountId, untilMs, description);
 }
 
 /** Pulls a human-readable description out of an Xbox error body, if present. */
@@ -549,8 +583,14 @@ export async function probeGamertagReservation(
   } else {
     const picked = pickProbeAccount();
     if (!picked) {
-      logProbeDiagnostic({ gamertag, error: "no Xbox account connected" });
-      return { status: "auth_required", message: "No Xbox account connected. Connect Xbox first." };
+      const any = getAccountInfoList().length > 0;
+      logProbeDiagnostic({ gamertag, error: any ? "every account is rate-limited" : "no Xbox account connected" });
+      return {
+        status: any ? "rate_limited" : "auth_required",
+        message: any
+          ? "Every connected Xbox account is currently rate-limited and suspended from searching."
+          : "No Xbox account connected. Connect Xbox first.",
+      };
     }
     id = picked;
   }
@@ -615,6 +655,7 @@ export async function probeGamertagReservation(
       if (rs === 429) {
         const backoffMs = retryAfterMs(reserve.headers, 2_000);
         raiseProbeSpacing(id, backoffMs);
+        suspendAccountForRateLimit(id, reserve, "probing a reservation");
         if (attempt === 0) {
           await wait(backoffMs, signal);
           continue;
@@ -786,6 +827,7 @@ export async function claimGamertag(
     const base = { step: "reserve" as const, httpStatus: rs, xboxResponse: snippet(rBody) };
 
     if (rs === 429) {
+      suspendAccountForRateLimit(accountId, reserve, "reserving a gamertag");
       return finish("rate_limited", {
         ...base, errorCode: "rate_limited",
         retryAfterMs: retryAfterMs(reserve.headers, 30_000),
@@ -908,6 +950,7 @@ export async function claimGamertag(
       });
     }
     if (cs === 429) {
+      suspendAccountForRateLimit(accountId, change, "changing a gamertag");
       return finish("rate_limited", {
         ...cbase, errorCode: "rate_limited", retryAfterMs: retryAfterMs(change.headers, 30_000),
         reason: "Xbox rate-limited the change request (HTTP 429).",

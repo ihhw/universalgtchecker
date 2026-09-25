@@ -15,6 +15,8 @@ export interface XboxAccountInfo {
     code: string | null;
     checkedAt: number | null;
   };
+  rateLimitedUntil: number | null;
+  rateLimitReason: string | null;
 }
 
 const BASE = import.meta.env.BASE_URL.replace(/\/$/, "");

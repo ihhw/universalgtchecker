@@ -235,14 +235,28 @@ function AccountManager({ onAddAnother }: { onAddAnother: () => void }) {
             <li key={a.id} className="flex items-center gap-3 px-3.5 py-2.5">
               <span
                 aria-hidden="true"
-                className={cn("h-2 w-2 shrink-0 rounded-full", a.readiness.ready ? "bg-primary" : "bg-destructive")}
+                className={cn(
+                  "h-2 w-2 shrink-0 rounded-full",
+                  a.rateLimitedUntil ? "bg-amber-500" : a.readiness.ready ? "bg-primary" : "bg-destructive",
+                )}
               />
               <div className="min-w-0 flex-1">
-                <p className="truncate text-[13px] font-medium">
+                <p className="flex items-center gap-1.5 truncate text-[13px] font-medium">
                   {a.gamertag ?? a.maskedEmail ?? "Unverified account"}
+                  {a.rateLimitedUntil && (
+                    <span
+                      title={a.rateLimitReason ?? "Rate limited"}
+                      className="shrink-0 rounded border border-amber-500/40 bg-amber-500/10 px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-wide text-amber-500"
+                    >
+                      Rate limited
+                    </span>
+                  )}
                 </p>
                 <p className="truncate text-[11px] text-muted-foreground">
-                  {a.maskedEmail ?? "Email not shared"}{a.isActive && " · Active"}
+                  {a.rateLimitedUntil
+                    ? (a.rateLimitReason ?? "Not usable right now — suspended from searching.")
+                    : (a.maskedEmail ?? "Email not shared")}
+                  {a.isActive && " · Active"}
                 </p>
               </div>
               {!a.isActive && (
