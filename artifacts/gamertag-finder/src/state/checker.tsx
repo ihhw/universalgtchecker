@@ -52,6 +52,8 @@ const SAVED_KEY = "gtag-saved";
 const DOUBLE_CHECK_KEY = "gtag-ethan-policy";
 const AUTOCLAIM_KEY = "gtag-autoclaim";
 const RATE_KEY = "universal-xbox-rate";
+/** Ceiling with no proxies configured; the server raises this once proxies are set. */
+export const DEFAULT_MAX_RATE = 50;
 const MODE_KEY = "universal-xbox-mode";
 const PARAMS_KEY = "universal-xbox-params";
 const TEMPLATES_KEY = "universal-xbox-templates";
@@ -73,6 +75,10 @@ interface CheckerContextValue {
   // search settings
   rate: number;
   setRate: (n: number) => void;
+  /** Current server-enforced rate ceiling (higher once proxies are configured). */
+  maxRate: number;
+  proxyCount: number;
+  refreshProxyState: () => Promise<void>;
   doubleCheck: boolean;
   setDoubleCheck: (v: boolean) => void;
   autoClaim: boolean;
@@ -168,6 +174,21 @@ export function CheckerProvider({ children }: { children: ReactNode }) {
   const [paramsByMode, setParamsByMode] = useState<Record<string, Params>>(readParams);
   const [savedTemplates, setSavedTemplates] = useState<TemplateDef[]>(readTemplates);
   const [validation, setValidation] = useState<ConfigValidation>({ status: "checking", errors: [], label: "", info: {}, samples: [] });
+
+  const [maxRate, setMaxRate] = useState(DEFAULT_MAX_RATE);
+  const [proxyCount, setProxyCount] = useState(0);
+
+  const refreshProxyState = useCallback(async () => {
+    try {
+      const res = await fetch(api("/xbox/settings/proxies"));
+      if (!res.ok) return;
+      const d = (await res.json()) as { count?: number; maxRate?: number };
+      if (typeof d.maxRate === "number") setMaxRate(d.maxRate);
+      if (typeof d.count === "number") setProxyCount(d.count);
+    } catch { /* leave previous state */ }
+  }, []);
+
+  useEffect(() => { void refreshProxyState(); }, [refreshProxyState]);
 
   const [rate, setRateState] = useState(() => {
     const n = Number(readStored(RATE_KEY));
@@ -295,10 +316,10 @@ export function CheckerProvider({ children }: { children: ReactNode }) {
 
   // ── Search settings ────────────────────────────────────────────────────────
   const setRate = useCallback((n: number) => {
-    const v = Math.min(1000, Math.max(1, Math.round(n) || 1));
+    const v = Math.min(maxRate, Math.max(1, Math.round(n) || 1));
     setRateState(v);
     writeStored(RATE_KEY, String(v));
-  }, []);
+  }, [maxRate]);
   const setDoubleCheck = useCallback((v: boolean) => { setDoubleCheckState(v); writeStored(DOUBLE_CHECK_KEY, String(v)); }, []);
   const setAutoClaim = useCallback((v: boolean) => { setAutoClaimState(v); writeStored(AUTOCLAIM_KEY, String(v)); }, []);
 
@@ -491,14 +512,14 @@ export function CheckerProvider({ children }: { children: ReactNode }) {
     mode, setMode, params, setParams, validation,
     builtinTemplates: BUILTIN_TEMPLATES, savedTemplates, applyTemplate, saveTemplate, deleteTemplate,
     templateSourceLabel: MODE_BY_ID[lastRealMode]?.label ?? "",
-    rate, setRate, doubleCheck, setDoubleCheck, autoClaim, setAutoClaim,
+    rate, setRate, maxRate, proxyCount, refreshProxyState, doubleCheck, setDoubleCheck, autoClaim, setAutoClaim,
     sessionId, snapshot, isRunning, isPaused, starting, start, stop, togglePause, reset,
     feed, feedConnected, clearFeed, hits,
     saved, save, unsave, exportSaved, claimStatuses, claimRecords, claim,
     auth, isAuthed, accountReady, connectOpen, setConnectOpen,
   }), [
     mode, setMode, params, setParams, validation, savedTemplates, applyTemplate, saveTemplate, deleteTemplate, lastRealMode,
-    rate, setRate, doubleCheck, setDoubleCheck, autoClaim, setAutoClaim,
+    rate, setRate, maxRate, proxyCount, refreshProxyState, doubleCheck, setDoubleCheck, autoClaim, setAutoClaim,
     sessionId, snapshot, isRunning, isPaused, starting, start, stop, togglePause, reset,
     feed, feedConnected, clearFeed, hits, saved, save, unsave, exportSaved, claimStatuses, claimRecords, claim,
     auth, isAuthed, accountReady, connectOpen,

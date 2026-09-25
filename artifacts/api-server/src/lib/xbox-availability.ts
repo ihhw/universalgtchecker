@@ -10,10 +10,97 @@
  * returns exactly `approved` for may be treated as available.
  */
 
+import { fetch as undiciFetch, ProxyAgent, type Dispatcher } from "undici";
 import { logger } from "./logger";
 import { isBlockedByContentFilter } from "./content-filter";
 import { getAccountInfoList, getClaimContext } from "./xbox-auth";
 import { fastFetch, retryAfterMs, xboxUrl } from "./xbox-http";
+import { getProxies } from "./xbox-proxy-store";
+
+/**
+ * Rate ceiling for the primary CDN check, shown to and enforced for the
+ * client. avatar-ssl.xboxlive.com has no auth but rate-limits a single IP
+ * hard at real volume (confirmed live: 1000/s from one home connection
+ * collapsed to ~114/s actual throughput with 97% "unknown"). Without
+ * proxies the rate stays low enough that one IP can sustain it reliably;
+ * with proxies, load spreads across them and a much higher rate becomes
+ * usable without the CDN check silently failing on most requests.
+ */
+export const MAX_RATE_NO_PROXY = 50;
+// The API schema's own rate field caps at 1000 (StartGamertagSearchBody);
+// matching it here rather than raising it avoids touching generated codegen.
+export const MAX_RATE_WITH_PROXY = 1_000;
+
+export function currentMaxRate(): number {
+  return getProxies().length > 0 ? MAX_RATE_WITH_PROXY : MAX_RATE_NO_PROXY;
+}
+
+/**
+ * Per-proxy round-robin with a cooldown for proxies that keep failing, so a
+ * few bad ones in a large list don't drag down the whole pool. Mirrors the
+ * Discord checker's proxy pool (same shape, simplified: the CDN check is an
+ * anonymous GET with no per-identity headers to keep stable across
+ * requests, unlike Discord's client fingerprint).
+ */
+interface CdnProxyState {
+  deadUntil: number;
+  consecutiveFail: number;
+}
+const cdnProxyStates = new Map<string, CdnProxyState>();
+const cdnProxyAgents = new Map<string, ProxyAgent>();
+let cdnProxyCursor = 0;
+
+function cdnAgentFor(proxy: string): ProxyAgent {
+  let agent = cdnProxyAgents.get(proxy);
+  if (!agent) {
+    agent = new ProxyAgent(proxy);
+    cdnProxyAgents.set(proxy, agent);
+  }
+  return agent;
+}
+
+function pickCdnProxy(): string | null {
+  const proxies = getProxies();
+  if (proxies.length === 0) return null;
+  const now = Date.now();
+  for (let i = 0; i < proxies.length; i++) {
+    const idx = (cdnProxyCursor + i) % proxies.length;
+    const candidate = proxies[idx]!;
+    const state = cdnProxyStates.get(candidate);
+    if (!state || state.deadUntil <= now) {
+      cdnProxyCursor = idx + 1;
+      return candidate;
+    }
+  }
+  // Every proxy is cooling down: use the one that frees up soonest rather
+  // than stalling entirely.
+  let best = proxies[cdnProxyCursor % proxies.length]!;
+  let bestReady = Infinity;
+  for (const p of proxies) {
+    const ready = cdnProxyStates.get(p)?.deadUntil ?? 0;
+    if (ready < bestReady) { bestReady = ready; best = p; }
+  }
+  cdnProxyCursor++;
+  return best;
+}
+
+const CDN_PROXY_DEAD_STRIKES = 3;
+const CDN_PROXY_DEAD_COOLDOWN_MS = 30_000;
+
+function markCdnProxyFail(proxy: string, cooldownMs = 0): void {
+  const state = cdnProxyStates.get(proxy) ?? { deadUntil: 0, consecutiveFail: 0 };
+  state.consecutiveFail++;
+  const strikeCooldown = state.consecutiveFail >= CDN_PROXY_DEAD_STRIKES ? CDN_PROXY_DEAD_COOLDOWN_MS : 0;
+  const effective = Math.max(cooldownMs, strikeCooldown);
+  if (effective > 0) {
+    state.deadUntil = Math.max(state.deadUntil, Date.now() + effective);
+    if (strikeCooldown > 0) state.consecutiveFail = 0;
+  }
+  cdnProxyStates.set(proxy, state);
+}
+function markCdnProxyOk(proxy: string): void {
+  cdnProxyStates.set(proxy, { deadUntil: 0, consecutiveFail: 0 });
+}
 
 export type ResultStatus = "available" | "taken" | "inappropriate" | "seen" | "unknown" | "error";
 
@@ -365,21 +452,43 @@ export async function checkViaCDNDetailed(
   fast = false,
 ): Promise<CdnDetail> {
   const url = `https://avatar-ssl.xboxlive.com/avatar/${encodeURIComponent(gt)}/avatar-body.png`;
-  try {
-    const res = fast
-      ? await fastFetch(url, { signal, headers: { Accept: "image/png" } })
-      : await fetch(xboxUrl(url), { signal, headers: { Accept: "image/png" } });
-    // Drain so a keep-alive socket can be reused.
-    if (fast) void res.text().catch(() => undefined);
-
-    if (res.status === 200) return { status: "taken", httpStatus: 200 };                          // in CDN = profile exists
-    if (res.status === 401 || res.status === 404) return { status: "available", httpStatus: res.status }; // not in CDN = likely free
-    if (res.status === 429) {
-      return { status: null, httpStatus: 429, retryAfterMs: retryAfterMs(res.headers as Headers, 5_000) };
+  const proxy = pickCdnProxy();
+  let dispatcher: Dispatcher | undefined;
+  if (proxy) {
+    try {
+      dispatcher = cdnAgentFor(proxy);
+    } catch (err) {
+      logger.warn({ proxy, err }, "Could not build Xbox CDN proxy agent; falling back to a direct request");
+      dispatcher = undefined;
     }
+  }
+  try {
+    const res = proxy
+      ? await undiciFetch(xboxUrl(url), { signal, headers: { Accept: "image/png" }, dispatcher })
+      : fast
+        ? await fastFetch(url, { signal, headers: { Accept: "image/png" } })
+        : await fetch(xboxUrl(url), { signal, headers: { Accept: "image/png" } });
+    // Drain so a keep-alive socket can be reused.
+    if (fast || proxy) void res.text().catch(() => undefined);
+
+    if (res.status === 200) {
+      if (proxy) markCdnProxyOk(proxy);
+      return { status: "taken", httpStatus: 200 };                          // in CDN = profile exists
+    }
+    if (res.status === 401 || res.status === 404) {
+      if (proxy) markCdnProxyOk(proxy);
+      return { status: "available", httpStatus: res.status }; // not in CDN = likely free
+    }
+    if (res.status === 429) {
+      const backoff = retryAfterMs(res.headers as Headers, 5_000);
+      if (proxy) markCdnProxyFail(proxy, backoff);
+      return { status: null, httpStatus: 429, retryAfterMs: backoff };
+    }
+    if (proxy) markCdnProxyFail(proxy);
     return { status: null, httpStatus: res.status };
   } catch (err) {
     const name = err instanceof Error ? err.name : "";
+    if (proxy) markCdnProxyFail(proxy);
     return { status: null, httpStatus: null, networkError: name === "TimeoutError" || name === "AbortError" ? "timeout" : "network" };
   }
 }

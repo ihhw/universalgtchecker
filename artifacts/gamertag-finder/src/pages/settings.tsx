@@ -32,7 +32,7 @@ async function readError(res: Response): Promise<string> {
 }
 
 export default function SettingsPage() {
-  const { autoClaim, setAutoClaim, isAuthed, setConnectOpen } = useChecker();
+  const { autoClaim, setAutoClaim, isAuthed, setConnectOpen, refreshProxyState: refreshXboxProxyState } = useChecker();
   const { refreshProxyState } = useDiscordChecker();
   const [webhook, setWebhook] = useState<WebhookState | null>(null);
   const [url, setUrl] = useState("");
@@ -44,6 +44,11 @@ export default function SettingsPage() {
   const [proxyBusy, setProxyBusy] = useState(false);
   const [proxyError, setProxyError] = useState<string | null>(null);
 
+  const [xboxProxyState, setXboxProxyState] = useState<ProxyState | null>(null);
+  const [xboxProxyText, setXboxProxyText] = useState("");
+  const [xboxProxyBusy, setXboxProxyBusy] = useState(false);
+  const [xboxProxyError, setXboxProxyError] = useState<string | null>(null);
+
   const load = useCallback(async (signal?: AbortSignal) => {
     try {
       const res = await fetch(api("/settings/webhook"), { signal });
@@ -52,6 +57,10 @@ export default function SettingsPage() {
     try {
       const res = await fetch(api("/discord/settings/proxies"), { signal });
       if (res.ok) setProxyState((await res.json()) as ProxyState);
+    } catch { /* leave the previous state */ }
+    try {
+      const res = await fetch(api("/xbox/settings/proxies"), { signal });
+      if (res.ok) setXboxProxyState((await res.json()) as ProxyState);
     } catch { /* leave the previous state */ }
   }, []);
 
@@ -97,6 +106,46 @@ export default function SettingsPage() {
     if (res) {
       setProxyState((await res.json()) as ProxyState);
       void refreshProxyState();
+      toast.info("Proxies cleared");
+    }
+  };
+
+  const sendXboxProxies = async (method: "PUT" | "DELETE", body?: unknown): Promise<Response | null> => {
+    setXboxProxyBusy(true);
+    setXboxProxyError(null);
+    try {
+      const res = await fetch(api("/xbox/settings/proxies"), {
+        method,
+        headers: body ? { "Content-Type": "application/json" } : undefined,
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      if (!res.ok) { setXboxProxyError(await readError(res)); return null; }
+      return res;
+    } catch {
+      setXboxProxyError("Could not reach the server.");
+      return null;
+    } finally {
+      setXboxProxyBusy(false);
+    }
+  };
+
+  const saveXboxProxies = async () => {
+    const res = await sendXboxProxies("PUT", { proxies: xboxProxyText });
+    if (res) {
+      const d = (await res.json()) as ProxyState & { skipped?: number };
+      setXboxProxyState(d);
+      setXboxProxyText("");
+      void refreshXboxProxyState();
+      toast.success(
+        d.skipped ? `Saved ${d.count} ${d.count === 1 ? "proxy" : "proxies"} (${d.skipped} skipped)` : `Saved ${d.count} ${d.count === 1 ? "proxy" : "proxies"}`,
+      );
+    }
+  };
+  const clearXboxProxies = async () => {
+    const res = await sendXboxProxies("DELETE");
+    if (res) {
+      setXboxProxyState((await res.json()) as ProxyState);
+      void refreshXboxProxyState();
       toast.info("Proxies cleared");
     }
   };
@@ -203,6 +252,69 @@ export default function SettingsPage() {
               )}
             </div>
           )}
+        </Panel>
+
+        <Panel>
+          <Eyebrow>Xbox proxies</Eyebrow>
+          <p className="mt-3 max-w-xl text-[13px] leading-relaxed text-muted-foreground">
+            Xbox's avatar CDN check (the fast, unauthenticated primary check) rate-limits a single IP hard
+            at real volume. Without proxies the checker stays under 50/s; with some configured, load spreads
+            across them and up to 1000/s becomes usable — the checker's rate slider adjusts automatically.
+            One per line —{" "}
+            <code className="font-mono text-[12px]">host:port</code>,{" "}
+            <code className="font-mono text-[12px]">host:port:user:pass</code>, or{" "}
+            <code className="font-mono text-[12px]">http://user:pass@host:port</code>. HTTP/HTTPS only — SOCKS
+            proxies aren't supported. Stored only on the server, never sent to the browser.
+          </p>
+
+          {xboxProxyState !== null && (
+            <div className="mt-5 flex items-center justify-between gap-4 rounded-lg border border-border bg-[hsl(var(--well))] px-4 py-3">
+              <div className="min-w-0">
+                <p className="text-sm font-medium">
+                  {xboxProxyState.count > 0
+                    ? `${xboxProxyState.count.toLocaleString()} ${xboxProxyState.count === 1 ? "proxy" : "proxies"} configured`
+                    : "No proxies configured"}
+                </p>
+                {xboxProxyState.preview.length > 0 && (
+                  <p className="mt-0.5 truncate font-mono text-[12px] text-muted-foreground">
+                    {xboxProxyState.preview.join(", ")}
+                    {xboxProxyState.count > xboxProxyState.preview.length ? `, +${xboxProxyState.count - xboxProxyState.preview.length} more` : ""}
+                  </p>
+                )}
+              </div>
+              {xboxProxyState.count > 0 && (
+                <button type="button" className={btn} disabled={xboxProxyBusy} onClick={() => void clearXboxProxies()}>
+                  Clear
+                </button>
+              )}
+            </div>
+          )}
+
+          <div className="mt-5">
+            <textarea
+              rows={6}
+              spellCheck={false}
+              autoCapitalize="off"
+              autoComplete="off"
+              value={xboxProxyText}
+              onChange={(e) => setXboxProxyText(e.target.value)}
+              placeholder={"1.2.3.4:8080\nuser:pass@1.2.3.4:8080\n1.2.3.4:8080:user:pass"}
+              aria-label="Xbox proxy list"
+              className="w-full rounded-lg border border-border bg-[hsl(var(--well))] px-4 py-2.5 font-mono text-sm placeholder:text-muted-foreground/50 focus:border-primary/60 focus:outline-none"
+            />
+            <div className="mt-3 flex flex-wrap gap-3">
+              <button
+                type="button"
+                disabled={xboxProxyBusy || xboxProxyText.trim() === ""}
+                onClick={() => void saveXboxProxies()}
+                className="rounded-lg bg-primary px-5 py-2.5 text-sm font-semibold text-primary-foreground transition-opacity hover:opacity-90 disabled:opacity-50"
+              >
+                Save
+              </button>
+            </div>
+          </div>
+
+          {xboxProxyError && <p role="alert" className="mt-3 text-sm text-destructive">{xboxProxyError}</p>}
         </Panel>
 
         <Panel>

@@ -1,4 +1,5 @@
 import type { CSSProperties } from "react";
+import { Link } from "wouter";
 import { Pause, Play, Square, Zap } from "lucide-react";
 import { Switch } from "@/components/ui/switch";
 import { Panel, Eyebrow, PageHeader } from "@/components/panel";
@@ -112,7 +113,7 @@ function ConfigStatus({ v }: { v: ConfigValidation }) {
 export default function XboxPage() {
   const c = useChecker();
   const s = c.snapshot;
-  const fill = ((c.rate - 1) / 999) * 100;
+  const fill = ((c.rate - 1) / Math.max(1, c.maxRate - 1)) * 100;
   const def = MODE_BY_ID[c.mode]!;
   const canStart = c.validation.status === "ok";
 
@@ -200,7 +201,7 @@ export default function XboxPage() {
               id="rate"
               type="range"
               min={1}
-              max={1000}
+              max={c.maxRate}
               step={1}
               value={c.rate}
               disabled={c.isRunning}
@@ -208,6 +209,15 @@ export default function XboxPage() {
               style={{ "--fill": `${fill}%` } as CSSProperties}
               className="range mt-2"
             />
+            {c.proxyCount === 0 && (
+              <p className="mt-2 text-[12px] leading-relaxed text-muted-foreground">
+                Capped at {c.maxRate}/s without proxies — Xbox's CDN rate-limits a single IP hard past this.{" "}
+                <Link href="/settings" className="font-medium text-primary underline underline-offset-2 hover:opacity-80">
+                  Add proxies in Settings
+                </Link>{" "}
+                to raise this up to 1000/s.
+              </p>
+            )}
 
             <div className="mt-4 divide-y divide-border/60">
               <Option

@@ -14,7 +14,7 @@ import { logger } from "../lib/logger";
 import { isBlockedByContentFilter } from "../lib/content-filter";
 import { getAuthHeader } from "../lib/xbox-auth";
 import {
-  checkGamertag, checkViaAvailabilityEndpoint, checkViaCDN, runEthanPolicyCheck,
+  checkGamertag, checkViaAvailabilityEndpoint, checkViaCDN, runEthanPolicyCheck, currentMaxRate, MAX_RATE_WITH_PROXY,
   type PolicyStatus, type ResultStatus,
 } from "../lib/xbox-availability";
 import { claimGamertag, listClaims, notifyClaimWebhook, probeGamertagReservation, type ClaimRecord } from "../lib/xbox-claim";
@@ -22,6 +22,7 @@ import { compileGeneration, type Generator } from "../lib/gamertag-generator";
 import { validateXboxGamertag } from "../lib/xbox-validation";
 import { pushActivity } from "../lib/activity";
 import { getWebhookTarget, sendWebhookPayload } from "../lib/webhook-store";
+import { getPublicProxyState, setProxies, clearProxies } from "../lib/xbox-proxy-store";
 
 const router: IRouter = Router();
 
@@ -603,8 +604,13 @@ router.post("/gamertag/search", async (req, res): Promise<void> => {
   }
 
   const { config, rate, runEthanPolicyCheck, autoClaim } = parsed.data;
-  if (!Number.isFinite(rate) || rate < 1 || rate > 1_000) {
-    res.status(400).json({ error: "Rate must be between 1 and 1000 checks per second." });
+  const maxRate = currentMaxRate();
+  if (!Number.isFinite(rate) || rate < 1 || rate > maxRate) {
+    res.status(400).json({
+      error: maxRate < 1_000
+        ? `Rate must be between 1 and ${maxRate} checks per second without proxies configured. Add Xbox proxies in Settings to raise this to ${MAX_RATE_WITH_PROXY}.`
+        : `Rate must be between 1 and ${maxRate} checks per second.`,
+    });
     return;
   }
 
@@ -853,6 +859,38 @@ router.get("/gamertag/sessions/:sessionId/stream", async (req, res): Promise<voi
   req.on("close", () => {
     session.sseClients = session.sseClients.filter((c) => c !== res);
   });
+});
+
+// ─── Proxies (primary CDN check) ───────────────────────────────────────────
+//
+// avatar-ssl.xboxlive.com rate-limits a single IP hard at real volume.
+// Proxies are optional: without any, the checker stays under
+// MAX_RATE_NO_PROXY; with some, load spreads across them and a much higher
+// rate is allowed. Proxy URLs can carry credentials, so — like the Discord
+// proxy pool and the webhook URL — they are stored only on the server and
+// never returned to the browser.
+
+router.get("/xbox/settings/proxies", (_req, res): void => {
+  res.json({ ...getPublicProxyState(), maxRate: currentMaxRate() });
+});
+
+router.put("/xbox/settings/proxies", (req, res): void => {
+  const body = (req.body ?? {}) as { proxies?: unknown };
+  if (typeof body.proxies !== "string") {
+    res.status(400).json({ error: "proxies must be a string (one per line)." });
+    return;
+  }
+  const result = setProxies(body.proxies);
+  if (!result.ok) {
+    res.status(400).json({ error: result.error });
+    return;
+  }
+  res.json({ ...getPublicProxyState(), maxRate: currentMaxRate(), skipped: result.skipped });
+});
+
+router.delete("/xbox/settings/proxies", (_req, res): void => {
+  clearProxies();
+  res.json({ ...getPublicProxyState(), maxRate: currentMaxRate() });
 });
 
 /** Lightweight counters for the system-status endpoint. */

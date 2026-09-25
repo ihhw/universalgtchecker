@@ -60,6 +60,7 @@ artifacts/api-server/state.json
 artifacts/api-server/discord-results.txt
 artifacts/api-server/discord-state.json
 artifacts/api-server/discord-proxies.json
+artifacts/api-server/xbox-proxies.json
 artifacts/api-server/probe-debug.log
 # Same files, ignored again bare: packaging/windows/start.cmd (and the
 # systemd unit in packaging/linux-app) run the built server with the repo
@@ -67,6 +68,7 @@ artifacts/api-server/probe-debug.log
 discord-results.txt
 discord-state.json
 discord-proxies.json
+xbox-proxies.json
 results.txt
 state.json
 stats.json
