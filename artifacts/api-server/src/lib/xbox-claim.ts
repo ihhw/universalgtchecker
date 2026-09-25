@@ -250,6 +250,37 @@ export function listClaims(afterId = 0): ClaimRecord[] {
 const busy = new Map<string, string>();
 export function claimInProgress(accountId: string): string | null { return busy.get(accountId) ?? null; }
 
+/**
+ * Round-robins the reservation probe across every connected, non-busy
+ * account instead of always using just the active one.
+ *
+ * The probe's real throughput ceiling is per-account (each can only
+ * sustain about one confirmation every 350ms-8s, per PROBE_SPACING_*
+ * above) — with a single connected account, that's the hard limit on how
+ * fast a batch of hits can ever get confirmed, however high the check
+ * rate is. Spreading probes across every connected account (each with its
+ * own independent spacing state, since probeStateByAccount is keyed by
+ * account id) multiplies that ceiling by however many accounts are
+ * connected, instead of queuing everything behind one.
+ */
+let probeAccountCursor = 0;
+function pickProbeAccount(): string | null {
+  const all = getAccountInfoList();
+  if (all.length === 0) return null;
+  for (let i = 0; i < all.length; i++) {
+    const idx = (probeAccountCursor + i) % all.length;
+    const candidate = all[idx]!;
+    if (!busy.has(candidate.id)) {
+      probeAccountCursor = idx + 1;
+      return candidate.id;
+    }
+  }
+  // Every account is mid-claim: still return one rather than refusing to probe at all.
+  const candidate = all[probeAccountCursor % all.length]!;
+  probeAccountCursor++;
+  return candidate.id;
+}
+
 export type AccountSelection = "automatic" | string;
 
 /**
@@ -487,11 +518,20 @@ export async function probeGamertagReservation(
   accountId?: AccountSelection,
   signal?: AbortSignal,
 ): Promise<ReservationProbeResult> {
-  const selection = selectAccountForClaim(accountId);
-  if (!selection.ok) {
-    return { status: selection.kind === "busy" ? "error" : "auth_required", message: selection.reason };
+  let id: string;
+  if (accountId && accountId !== "automatic") {
+    // An explicit pin still goes through the normal single-account
+    // resolution and its busy check.
+    const selection = selectAccountForClaim(accountId);
+    if (!selection.ok) {
+      return { status: selection.kind === "busy" ? "error" : "auth_required", message: selection.reason };
+    }
+    id = selection.accountId;
+  } else {
+    const picked = pickProbeAccount();
+    if (!picked) return { status: "auth_required", message: "No Xbox account connected. Connect Xbox first." };
+    id = picked;
   }
-  const id = selection.accountId;
   // Never probe an account mid a real claim — a probe's own reserve call
   // could otherwise land in between that claim's reserve and change steps.
   if (claimInProgress(id)) {
