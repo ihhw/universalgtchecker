@@ -80,6 +80,21 @@ const sessions = new Map<string, Session>();
 // Auto-save paths
 const RESULTS_FILE = path.join(process.cwd(), "results.txt");
 const STATE_FILE   = path.join(process.cwd(), "state.json");
+/**
+ * Diagnostic: whenever the primary CDN check says "available" but the
+ * re-verify step disagrees (see below), this is logged unconditionally —
+ * no LOG_LEVEL flag. Added because a real run showed 0 available across
+ * hundreds of checks with probe-debug.log staying completely empty,
+ * meaning candidates were never even reaching the suffix probe. This is
+ * the stage right before it; whichever of these two files stays empty
+ * tells us which stage is actually dropping everything.
+ */
+const CHECKER_DEBUG_FILE = path.join(process.cwd(), "checker-debug.log");
+function logCheckerDiagnostic(entry: Record<string, unknown>): void {
+  try {
+    fs.appendFileSync(CHECKER_DEBUG_FILE, `${JSON.stringify({ at: new Date().toISOString(), ...entry })}\n`);
+  } catch { /* best-effort; never let logging break a check */ }
+}
 // Persistent deduplication: once an available tag has been emitted, it is
 // never emitted as available again, including after a server restart.
 const shownAvailable = new Set<string>();
@@ -392,6 +407,7 @@ async function runSearch(session: Session): Promise<void> {
             reverify = "error";
           }
           if (reverify !== "available") {
+            logCheckerDiagnostic({ gamertag: gt, primary: "available", reverify, outcome: reverify === "taken" ? "taken" : "unknown" });
             status = reverify === "taken" ? "taken" : "unknown";
           } else {
             if (session.runEthanPolicyCheck) {
@@ -408,10 +424,14 @@ async function runSearch(session: Session): Promise<void> {
               // Auth, rate-limit, and network failures must not bypass the
               // secondary check and accidentally send an unverified tag.
               if (policyResult.status !== "approved") {
+                logCheckerDiagnostic({ gamertag: gt, primary: "available", reverify: "available", policy: policyResult.status, outcome: "unknown" });
                 status = "unknown";
               }
             }
-            if (status === "available") pendingSuffixCheck = true;
+            if (status === "available") {
+              pendingSuffixCheck = true;
+              logCheckerDiagnostic({ gamertag: gt, primary: "available", reverify: "available", outcome: "pending_probe" });
+            }
           }
         }
       } catch {

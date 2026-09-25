@@ -62,6 +62,7 @@ artifacts/api-server/discord-state.json
 artifacts/api-server/discord-proxies.json
 artifacts/api-server/xbox-proxies.json
 artifacts/api-server/probe-debug.log
+artifacts/api-server/checker-debug.log
 # Same files, ignored again bare: packaging/windows/start.cmd (and the
 # systemd unit in packaging/linux-app) run the built server with the repo
 # root as its cwd, not artifacts/api-server, so these can land at the root.
@@ -74,6 +75,7 @@ state.json
 stats.json
 webhook.json
 probe-debug.log
+checker-debug.log
 artifacts/discord-bot/search_state.json
 
 artifacts/api-server/webhook.json
