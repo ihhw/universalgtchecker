@@ -1,12 +1,43 @@
 import type { CSSProperties } from "react";
-import { Pause, Play, Square } from "lucide-react";
+import { Pause, Play, Square, Zap } from "lucide-react";
 import { Switch } from "@/components/ui/switch";
 import { Panel, Eyebrow, PageHeader } from "@/components/panel";
 import { ActivityFeed } from "@/components/activity-feed";
 import { ModeForm, ModePicker, TemplatesPanel } from "@/components/mode-form";
 import { useChecker, type ConfigValidation } from "@/state/checker";
+import { useXboxAccounts } from "@/hooks/use-xbox-accounts";
 import { MODE_BY_ID } from "@/lib/modes";
 import { cn } from "@/lib/utils";
+
+/**
+ * A hit's exact-name verification is throttled per Xbox account (Xbox
+ * itself only allows so many of these checks per account per second), and
+ * that work spreads across every connected account instead of piling up
+ * on one. With a single account, verification can lag well behind a fast
+ * or large search; connecting more accounts is the only way to raise that
+ * ceiling.
+ */
+function VerificationThroughputHint() {
+  const { accounts } = useXboxAccounts();
+  const { setConnectOpen } = useChecker();
+  if (accounts === null) return null;
+  const readyCount = accounts.filter((a) => a.readiness.ready).length;
+  if (readyCount === 0) return null;
+  return (
+    <div className="mt-3 flex items-start gap-2.5 rounded-lg border border-border bg-[hsl(var(--well))] px-3.5 py-2.5">
+      <Zap className="mt-0.5 h-3.5 w-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
+      <p className="text-[12px] leading-relaxed text-muted-foreground">
+        {readyCount === 1
+          ? "1 Xbox account is verifying hits. Verification is throttled per account, so it can lag behind a fast or large search."
+          : `${readyCount} Xbox accounts are verifying hits in parallel, so confirmations keep up better with a fast or large search.`}
+        {" "}
+        <button type="button" onClick={() => setConnectOpen(true)} className="font-medium text-primary underline underline-offset-2 hover:opacity-80">
+          {readyCount === 1 ? "Connect more accounts to speed this up" : "Manage accounts"}
+        </button>
+      </p>
+    </div>
+  );
+}
 
 function Stat({ label, value, accent }: { label: string; value: number; accent?: boolean }) {
   return (
@@ -206,6 +237,7 @@ export default function XboxPage() {
                 disabled={c.isRunning}
               />
             </div>
+            {c.isAuthed && <VerificationThroughputHint />}
           </div>
         </Panel>
 
