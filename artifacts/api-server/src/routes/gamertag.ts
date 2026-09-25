@@ -304,7 +304,7 @@ async function runSearch(session: Session): Promise<void> {
             abort.signal,
             AbortSignal.timeout(20_000),
           ]);
-          const policyResult = await runEthanPolicyCheck(gt, policySignal);
+          const policyResult = await runEthanPolicyCheck(gt, policySignal, { fast: true });
           policy = { status: policyResult.status, message: policyResult.message };
           // An available result is only alertable after Ethan approves it.
           // Auth, rate-limit, and network failures must not bypass the

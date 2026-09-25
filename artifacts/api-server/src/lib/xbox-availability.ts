@@ -36,7 +36,27 @@ export interface PolicyResult {
 }
 
 const ETHAN_POLICY_URL = "https://user.mgt.xboxlive.com/gamertags/reserve";
-const POLICY_REQUEST_SPACING_MS = 350;
+
+/**
+ * Spacing between Double Check requests. This endpoint is tied to one
+ * authenticated account's XSTS token — unlike the Discord checker's proxy
+ * pool, there's no separate IP identity to spread load across, so the only
+ * safe lever is how fast this one account's requests go out.
+ *
+ * The 350ms floor is a starting guess, not a known-correct number. Rather
+ * than stay pinned to it (which either wastes headroom Xbox would actually
+ * allow, or — the reported problem — keeps re-triggering a limit that's
+ * actually tighter than 350ms), the spacing adapts: a 429's own Retry-After
+ * raises it immediately so the *next* request waits long enough the first
+ * time, and a run of clean responses relaxes it back down in steps, so a
+ * temporary tightening doesn't permanently slow later requests once Xbox
+ * is calm again.
+ */
+const POLICY_SPACING_FLOOR_MS = 350;
+const POLICY_SPACING_CAP_MS = 8_000;
+const POLICY_RELAX_AFTER_OK = 5;
+let policySpacingMs = POLICY_SPACING_FLOOR_MS;
+let policyConsecutiveOk = 0;
 let lastPolicyRequestAt = 0;
 let policyRequestQueue = Promise.resolve();
 
@@ -56,9 +76,25 @@ function getReservationId(): string | null {
   return configured || getXuid();
 }
 
+/** A 429 raises the spacing floor to at least what Xbox itself asked for. */
+function raisePolicySpacing(ms: number): void {
+  policySpacingMs = Math.min(POLICY_SPACING_CAP_MS, Math.max(policySpacingMs, ms));
+  policyConsecutiveOk = 0;
+}
+
+/** A streak of decisive (non-429) responses steps the spacing back toward the floor. */
+function notePolicyOk(): void {
+  if (policySpacingMs <= POLICY_SPACING_FLOOR_MS) return;
+  policyConsecutiveOk++;
+  if (policyConsecutiveOk >= POLICY_RELAX_AFTER_OK) {
+    policySpacingMs = Math.max(POLICY_SPACING_FLOOR_MS, Math.round(policySpacingMs * 0.7));
+    policyConsecutiveOk = 0;
+  }
+}
+
 function waitForPolicyRequestSlot(signal: AbortSignal): Promise<void> {
   const acquire = policyRequestQueue.then(async () => {
-    const delay = Math.max(0, POLICY_REQUEST_SPACING_MS - (Date.now() - lastPolicyRequestAt));
+    const delay = Math.max(0, policySpacingMs - (Date.now() - lastPolicyRequestAt));
     if (delay > 0) await wait(delay, signal);
     if (!signal.aborted) lastPolicyRequestAt = Date.now();
   });
@@ -68,8 +104,9 @@ function waitForPolicyRequestSlot(signal: AbortSignal): Promise<void> {
 
 /**
  * Double Check. `opts.retryOn429` keeps the checker's original behaviour (one
- * 5-second retry); the sniper passes false and applies its own backoff.
- * `opts.fast` routes the request through the keep-alive agent.
+ * retry, waiting whatever Xbox's own Retry-After says); the sniper passes
+ * false and applies its own backoff. `opts.fast` routes the request through
+ * the keep-alive agent.
  */
 export async function runEthanPolicyCheck(
   gamertag: string,
@@ -108,23 +145,25 @@ export async function runEthanPolicyCheck(
       if (opts.fast) void response.text().catch(() => undefined);
       const httpStatus = response.status;
 
-      if (response.status === 200) return { status: "approved", httpStatus };
-      if (response.status === 400) return { status: "banned", message: "Xbox marked this gamertag as unacceptable.", httpStatus };
-      if (response.status === 409) return { status: "unavailable", message: "Xbox reports this gamertag is no longer available.", httpStatus };
+      if (response.status === 200) { notePolicyOk(); return { status: "approved", httpStatus }; }
+      if (response.status === 400) { notePolicyOk(); return { status: "banned", message: "Xbox marked this gamertag as unacceptable.", httpStatus }; }
+      if (response.status === 409) { notePolicyOk(); return { status: "unavailable", message: "Xbox reports this gamertag is no longer available.", httpStatus }; }
       if (response.status === 401 || response.status === 403) {
         return { status: "auth_required", message: "The Xbox authorization token was rejected.", httpStatus };
       }
       if (response.status === 429) {
+        const backoffMs = retryAfterMs(response.headers as Headers, attempt === 0 ? 2_000 : 5_000);
+        raisePolicySpacing(backoffMs);
         if (attempt === 0 && retryOn429) {
-          logger.warn({ gamertag }, "Ethan policy check rate-limited; retrying in 5 seconds");
-          await wait(5_000, signal);
+          logger.warn({ gamertag, backoffMs }, "Ethan policy check rate-limited; retrying");
+          await wait(backoffMs, signal);
           continue;
         }
         return {
           status: "rate_limited",
           message: "Xbox rate-limited the secondary policy check.",
           httpStatus,
-          retryAfterMs: retryAfterMs(response.headers as Headers, 5_000),
+          retryAfterMs: backoffMs,
         };
       }
 
