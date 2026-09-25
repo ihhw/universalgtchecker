@@ -542,22 +542,30 @@ export async function probeGamertagReservation(
     // resolution and its busy check.
     const selection = selectAccountForClaim(accountId);
     if (!selection.ok) {
+      logProbeDiagnostic({ gamertag, error: `account selection failed: ${selection.reason}` });
       return { status: selection.kind === "busy" ? "error" : "auth_required", message: selection.reason };
     }
     id = selection.accountId;
   } else {
     const picked = pickProbeAccount();
-    if (!picked) return { status: "auth_required", message: "No Xbox account connected. Connect Xbox first." };
+    if (!picked) {
+      logProbeDiagnostic({ gamertag, error: "no Xbox account connected" });
+      return { status: "auth_required", message: "No Xbox account connected. Connect Xbox first." };
+    }
     id = picked;
   }
   // Never probe an account mid a real claim — a probe's own reserve call
   // could otherwise land in between that claim's reserve and change steps.
   if (claimInProgress(id)) {
+    logProbeDiagnostic({ gamertag, accountId: id, error: "account has a claim in progress" });
     return { status: "error", message: "This account has a claim in progress; skipped the probe." };
   }
 
   const ctx = await getClaimContext(id);
-  if (!ctx.ok) return { status: "auth_required", message: ctx.reason };
+  if (!ctx.ok) {
+    logProbeDiagnostic({ gamertag, accountId: id, error: `getClaimContext failed: ${ctx.reason}` });
+    return { status: "auth_required", message: ctx.reason };
+  }
 
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
@@ -585,6 +593,16 @@ export async function probeGamertagReservation(
       logger.debug({ gamertag, endpoint: "reserve", status: reserve.status, body: snippet(reserve.text) }, "xbox_probe");
 
       const rs = reserve.status;
+      // Log EVERY outcome here, not just a successful 200/201/204 -- a real
+      // run showed "available" names being reported as unavailable by this
+      // probe with zero entries ever appearing in the success-only log
+      // below, meaning every attempt was landing in one of the branches
+      // below (429/401/403/409/400/other) without ever being seen. In
+      // particular, mapping 400 to "taken" is a carried-over assumption
+      // from the OLD classicGamertag-targeted request shape and was never
+      // re-verified against the current modernGamertag-targeted one -- it
+      // may mean something else entirely now.
+      logProbeDiagnostic({ gamertag, accountId: id, httpStatus: rs, rawBody: reserve.text });
       if (rs === 429) {
         const backoffMs = retryAfterMs(reserve.headers, 2_000);
         raiseProbeSpacing(id, backoffMs);
@@ -609,11 +627,8 @@ export async function probeGamertagReservation(
       }
 
       const check = parseReserveSuffix(reserve.text, gamertag);
-      // Full raw response plus what we decided from it, side by side — so a
-      // mismatch (Xbox response says one thing, real availability says
-      // another) is visible directly from this file instead of needing
-      // another guess at what changed.
-      logProbeDiagnostic({ gamertag, accountId: id, httpStatus: rs, rawBody: reserve.text, verdict: check });
+      // Verdict appended to the same log entry already written above.
+      logProbeDiagnostic({ gamertag, accountId: id, httpStatus: rs, verdict: check, followUp: true });
       if (check.suffixed) {
         return {
           status: "suffix_required",
@@ -624,6 +639,13 @@ export async function probeGamertagReservation(
       return { status: "available", httpStatus: rs };
     } catch (err) {
       const kind = errorKind(err);
+      // If the request itself never got a response (network/timeout/thrown
+      // before send() returns), the log call above never ran either. Catch
+      // that case here too, so a probe that's failing before ever reaching
+      // Xbox is just as visible as one that reaches it and gets rejected.
+      logProbeDiagnostic({
+        gamertag, accountId: id, error: err instanceof Error ? `${err.name}: ${err.message}` : String(err),
+      });
       return {
         status: "error",
         message: kind === "timeout" ? "The reservation probe timed out." : "Could not reach Xbox for the reservation probe.",
