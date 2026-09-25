@@ -48,8 +48,10 @@ Options:
   --mode <letters|chars>        letters = a-z only, chars = a-z0-9 + one underscore (required)
   --strategy <exhaustive|sample>  exhaustive walks the full space in order (default), sample draws at random
   --sample-count <n>             Candidates to draw when --strategy sample (default 2000)
-  --concurrency <n>              Concurrent checks in flight (default 6)
-  --rps <n>                      Max HTTP requests/sec to Roblox, shared across all workers (default 4)
+  --concurrency <n>              Concurrent checks in flight (default 20)
+  --rps <n>                      Max HTTP requests/sec to Roblox, shared across all workers (default 20)
+                                  seeing a lot of "unknown" results with "http 429" in the review file?
+                                  Roblox is rate-limiting you — pass a lower --rps to back off.
   --limit <n>                    Stop after this many candidates this run (still resumable)
   --no-resume                    Ignore any saved checkpoint and start this (mode,length) over
   --yes                          Skip the confirmation prompt for long exhaustive runs
@@ -264,8 +266,8 @@ async function main(): Promise<void> {
   const typedMode = mode as UsernameMode;
 
   const strategy = typeof args.strategy === "string" ? args.strategy : "exhaustive";
-  const concurrency = Number(args.concurrency ?? 6);
-  const rps = Number(args.rps ?? 4);
+  const concurrency = Number(args.concurrency ?? 20);
+  const rps = Number(args.rps ?? 20);
   const limit = args.limit ? Number(args.limit) : Infinity;
   const sampleCount = Number(args["sample-count"] ?? 2000);
   const noResume = Boolean(args["no-resume"]);
