@@ -41,6 +41,8 @@
  * defence in depth in case Xbox's accepted method ever changes again).
  */
 
+import fs from "fs";
+import path from "path";
 import { logger } from "./logger";
 import { validateXboxGamertag } from "./xbox-validation";
 import { getClaimContext, refreshActiveIdentity, getActiveAccountId, getAccountInfoList } from "./xbox-auth";
@@ -48,6 +50,22 @@ import { fastFetch, retryAfterMs, warmConnection } from "./xbox-http";
 import { getWebhookTarget, sendWebhookPayload } from "./webhook-store";
 import { recordClaim } from "./stats";
 import { logAudit } from "./audit";
+
+/**
+ * Every reservation-probe response, raw and untruncated, appended here —
+ * always on, no LOG_LEVEL flag to remember to set. Repeated attempts to fix
+ * suffix detection from a single captured example kept guessing wrong about
+ * what a genuinely-available response looks like (this file exists because
+ * a "confirmed available" hit still turned out to need a suffix even after
+ * matching the one real captured example known at the time). Contains only
+ * gamertags and Xbox's own response bodies — no tokens, no account secrets.
+ */
+const PROBE_LOG_FILE = path.join(process.cwd(), "probe-debug.log");
+function logProbeDiagnostic(entry: Record<string, unknown>): void {
+  try {
+    fs.appendFileSync(PROBE_LOG_FILE, `${JSON.stringify({ at: new Date().toISOString(), ...entry })}\n`);
+  } catch { /* best-effort; never let logging break a probe */ }
+}
 
 const GAMERTAG_HOST = "https://gamertag.xboxlive.com";
 const RESERVE_URL   = `${GAMERTAG_HOST}/gamertags/reserve`;
@@ -591,6 +609,11 @@ export async function probeGamertagReservation(
       }
 
       const check = parseReserveSuffix(reserve.text, gamertag);
+      // Full raw response plus what we decided from it, side by side — so a
+      // mismatch (Xbox response says one thing, real availability says
+      // another) is visible directly from this file instead of needing
+      // another guess at what changed.
+      logProbeDiagnostic({ gamertag, accountId: id, httpStatus: rs, rawBody: reserve.text, verdict: check });
       if (check.suffixed) {
         return {
           status: "suffix_required",
