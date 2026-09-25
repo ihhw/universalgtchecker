@@ -20,6 +20,7 @@ beforeEach(async () => {
   mock.state.gamertag = keep.gamertag;
   mock.state.log.length = 0;
   webhooks.length = 0;
+  auth.clearAccountRateLimit("acct-1");
 });
 
 const calls = (ep: string) => mock.state.log.filter((l) => l.endpoint === ep);
@@ -152,6 +153,10 @@ test("429 → RATE LIMITED with Retry-After honoured (reserve and change)", asyn
   const r1 = await claim.claimGamertag("Busy", { source: "manual" });
   assert.equal(r1.state, "rate_limited");
   assert.equal(r1.retryAfterMs, 7_000);
+  // The first 429 suspends the account until the header-given Retry-After
+  // elapses; clear it to exercise the change-endpoint 429 as its own,
+  // independent scenario rather than waiting out the first one's window.
+  auth.clearAccountRateLimit("acct-1");
   await control(mock.url, { queues: { change: [{ status: 429, body: {} }] } });
   const r2 = await claim.claimGamertag("Busy2", { source: "manual" });
   assert.equal(r2.state, "rate_limited");

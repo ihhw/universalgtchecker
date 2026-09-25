@@ -26,6 +26,8 @@ beforeEach(() => {
   mock.state.reservations.clear();
   mock.state.gamertag = "OldTag";
   mock.state.log.length = 0;
+  auth.clearAccountRateLimit("acct-a");
+  auth.clearAccountRateLimit("acct-b");
 });
 
 test("explicit accountId claims with that account, regardless of which one is active", async () => {

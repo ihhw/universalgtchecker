@@ -7,6 +7,7 @@ const { mock } = await setup();
 const webhooks = captureWebhooks();
 const sniper = await import("../src/lib/xbox-sniper");
 const store = await import("../src/lib/webhook-store");
+const auth = await import("../src/lib/xbox-auth");
 
 let currentId: string | null = null;
 
@@ -22,6 +23,7 @@ beforeEach(() => {
   mock.state.gamertag = "OldTag";
   mock.state.log.length = 0;
   webhooks.length = 0;
+  auth.clearAccountRateLimit("acct-1");
 });
 
 /** Starts a target and remembers its id for snap()/stop() in the rest of the test. */

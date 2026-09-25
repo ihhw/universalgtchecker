@@ -382,7 +382,10 @@ const RATE_LIMIT_DEFAULT_MS = 6 * 60 * 60 * 1000;
 
 /** Suspends an account after a 429: marks it rate-limited and unusable for search/claims. */
 function suspendAccountForRateLimit(accountId: string, res: { headers: Headers; text: string }, what: string): void {
-  let windowMs = RATE_LIMIT_DEFAULT_MS;
+  // Trust an explicit signal from Xbox (Retry-After header, or a body-stated
+  // period) over the blind default — the default only exists for the case
+  // where Xbox gives no hint at all about how long the limit lasts.
+  let windowMs: number | null = null;
   let description = `Xbox rate-limited this account (HTTP 429) while ${what}.`;
   try {
     const body = JSON.parse(res.text) as { periodInSeconds?: number; maxRequests?: number; limitType?: string };
@@ -394,9 +397,10 @@ function suspendAccountForRateLimit(accountId: string, res: { headers: Headers; 
         body.maxRequests ? `, ${body.maxRequests}/${body.periodInSeconds ?? "?"}s` : ""
       }) while ${what}. Not usable right now.`;
     }
-  } catch { /* not JSON — fall back to the default window */ }
+  } catch { /* not JSON */ }
   const headerMs = retryAfterMs(res.headers, 0, 24 * 60 * 60 * 1000);
-  const untilMs = Date.now() + Math.max(windowMs, headerMs);
+  if (headerMs > 0) windowMs = windowMs === null ? headerMs : Math.max(windowMs, headerMs);
+  const untilMs = Date.now() + (windowMs ?? RATE_LIMIT_DEFAULT_MS);
   markAccountRateLimited(accountId, untilMs, description);
 }
 

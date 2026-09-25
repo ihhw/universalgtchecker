@@ -649,6 +649,14 @@ export function markAccountRateLimited(id: string, untilMs: number, reason: stri
   logAudit("ACCOUNT_RATE_LIMITED", { accountId: id, reason });
 }
 
+/** Clears a rate-limit tag immediately (Xbox's own window elapsing does this automatically otherwise). */
+export function clearAccountRateLimit(id: string): void {
+  const account = accounts.get(id);
+  if (!account) return;
+  account.rateLimitedUntil = null;
+  account.rateLimitReason = null;
+}
+
 /** True while the account's rate-limit window hasn't elapsed yet. Auto-clears once it has. */
 export function isAccountRateLimited(id: string): boolean {
   const account = accounts.get(id);
