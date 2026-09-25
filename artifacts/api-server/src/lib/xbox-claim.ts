@@ -70,18 +70,35 @@ const PROBE_SPACING_FLOOR_MS = 350;
 const PROBE_SPACING_CAP_MS = 8_000;
 const PROBE_RELAX_AFTER_OK = 5;
 
+/**
+ * Hard cap on how many probe calls may be queued for one account at once.
+ *
+ * Without this, a burst of simultaneous hits (bulk concurrent checking can
+ * run up to 250 workers at once) all queue behind the SAME account's
+ * single-file spacing chain — each one holding its worker's search slot the
+ * entire time it waits its turn, which can stretch to minutes once spacing
+ * backs off toward the 8s cap. Enough of those piling up starves every
+ * other worker of a chance to start a new check, which looks exactly like
+ * the checker freezing solid (state still "running", nothing moving).
+ * Rejecting new probes past this depth instead of queueing them keeps a
+ * burst degrading gracefully (those hits fall back to unprobed/unknown)
+ * instead of stalling the whole search.
+ */
+const PROBE_QUEUE_DEPTH_CAP = 8;
+
 interface AccountProbeState {
   spacingMs: number;
   consecutiveOk: number;
   lastRequestAt: number;
   queue: Promise<void>;
+  queueDepth: number;
 }
 const probeStateByAccount = new Map<string, AccountProbeState>();
 
 function probeStateFor(accountId: string): AccountProbeState {
   let state = probeStateByAccount.get(accountId);
   if (!state) {
-    state = { spacingMs: PROBE_SPACING_FLOOR_MS, consecutiveOk: 0, lastRequestAt: 0, queue: Promise.resolve() };
+    state = { spacingMs: PROBE_SPACING_FLOOR_MS, consecutiveOk: 0, lastRequestAt: 0, queue: Promise.resolve(), queueDepth: 0 };
     probeStateByAccount.set(accountId, state);
   }
   return state;
@@ -111,14 +128,20 @@ function noteProbeOk(accountId: string): void {
   }
 }
 
+class ProbeQueueFullError extends Error {}
+
 function waitForProbeSlot(accountId: string, signal?: AbortSignal): Promise<void> {
   const state = probeStateFor(accountId);
+  if (state.queueDepth >= PROBE_QUEUE_DEPTH_CAP) {
+    return Promise.reject(new ProbeQueueFullError("Reservation probe queue is full for this account."));
+  }
+  state.queueDepth++;
   const acquire = state.queue.then(async () => {
     const delay = Math.max(0, state.spacingMs - (Date.now() - state.lastRequestAt));
     if (delay > 0) await wait(delay, signal);
     if (!signal?.aborted) state.lastRequestAt = Date.now();
   });
-  state.queue = acquire.catch(() => undefined);
+  state.queue = acquire.catch(() => undefined).finally(() => { state.queueDepth--; });
   return acquire;
 }
 // Confirmed against live Xbox: gamertag.xboxlive.com/users/xuid(<xuid>)/gamertag
@@ -474,7 +497,17 @@ export async function probeGamertagReservation(
 
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      await waitForProbeSlot(id, signal);
+      try {
+        await waitForProbeSlot(id, signal);
+      } catch (err) {
+        if (err instanceof ProbeQueueFullError) {
+          // Fail fast instead of piling onto an already-deep queue — a
+          // burst of simultaneous hits degrades to "not probed this time"
+          // rather than tying up every search worker waiting its turn.
+          return { status: "rate_limited", message: "Too many reservation probes already queued for this account; skipped for now." };
+        }
+        throw err;
+      }
       // Matches the CONFIRMED real request Xbox's own site sends when you
       // type a candidate name (captured live traffic) — not the
       // classicGamertag-targeted guess this used before, which appears to

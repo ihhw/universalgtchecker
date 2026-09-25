@@ -134,6 +134,21 @@ test("Double Check OFF: the reserve probe confirms a genuinely free classic name
   assert.equal(calls("reserve").length, 1);
 });
 
+test("a burst of hits needing the probe all at once does not freeze the search", async () => {
+  // Regression test for a real freeze: a burst of simultaneous "available"
+  // hits used to all queue single-file behind one account's probe spacing,
+  // each holding its worker's search slot the whole time it waited its
+  // turn -- enough of them piling up starved every worker and the search
+  // never finished. The probe's queue-depth cap should make excess probes
+  // in a burst fail fast (skipped, not alertable) instead of blocking.
+  await control(mock.url, { latencyMs: { reserve: 300 } });
+  const names = Array.from({ length: 20 }, (_, i) => `BurstTag${i}`);
+  const { snap } = await runList(names, { rate: 20 });
+  assert.equal(snap.results.length, 20, "every hit got a result instead of the search stalling");
+  const skipped = snap.results.filter((r: any) => r.policy?.message?.includes("already queued"));
+  assert.ok(skipped.length > 0, "the queue-depth cap actually engaged under this burst");
+});
+
 test("POST /gamertag/claim: status codes and response shape (bot-compatible), no secrets", async () => {
   const ok = await post("/gamertag/claim", { gamertag: "RouteTag" });
   const okBody = await ok.json() as any;
