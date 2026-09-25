@@ -190,16 +190,21 @@ export function startMockXbox(port = 0): Promise<{ url: string; state: MockState
         }
         case "reserve": {
           if (!xstsOk) { send(401, { description: "Token audience is not valid for this service" }); return; }
-          const gt = String(b["classicGamertag"] ?? "");
+          // The real claim flow requests classicGamertag; the checker's
+          // reservation probe requests modernGamertag (confirmed real
+          // request shape, captured from account.xbox.com's own traffic).
+          // Accept either so both paths work against this mock.
+          const gt = String(b["classicGamertag"] ?? b["modernGamertag"] ?? "");
           const rid = String(b["reservationId"] ?? "");
           if (!gt || rid !== state.xuid) { send(400, { description: "Bad reservation request" }); return; }
           if (state.taken.has(gt.toUpperCase())) { send(409, { description: "Gamertag is not available" }); return; }
           state.reservations.set(gt.toUpperCase(), rid);
-          // Real Xbox response shape (confirmed via captured live traffic):
-          // no separate classicGamertag/gamertagSuffix fields. A free
-          // classic name comes back with classicTranslationLevel not
-          // "None" and no modernGamertagSuffix.
-          send(200, { promptForClassicGamertag: false, classicTranslationLevel: "Full", modernGamertag: gt, uniqueModernGamertag: gt, modernGamertagSuffix: "", gamertag: gt });
+          // Real Xbox response shape (confirmed via captured live traffic).
+          // promptForClassicGamertag is the real "classic slot available"
+          // signal; modernGamertagSuffix is populated on every response
+          // (it's just answering "what modern gamertag would this become"),
+          // not a suffix-required marker by itself.
+          send(200, { promptForClassicGamertag: true, classicTranslationLevel: "Full", modernGamertag: gt, uniqueModernGamertag: gt, modernGamertagSuffix: "0001", classicGamertag: gt, gamertag: gt });
           return;
         }
         case "change": {

@@ -347,50 +347,59 @@ export interface ReserveSuffixInfo {
 /**
  * Parses gamertag.xboxlive.com/gamertags/reserve's REAL response shape.
  *
- * CONFIRMED against a real live Xbox response (captured 2026-09-25 from
- * account.xbox.com's own gamertag-change page via browser devtools, for a
- * name that came back suffix-only):
+ * CONFIRMED against real captured live Xbox traffic (2026-09-25, from
+ * account.xbox.com's own gamertag-change page via browser devtools):
+ *
+ * Real REQUEST (what the official site actually sends when you type a
+ * candidate name — NOT what earlier attempts guessed):
+ *   {"reservationId":"...","modernGamertag":"Y301","targetGamertagFields":"modernGamertag"}
+ *
+ * Real RESPONSE, for a name that turned out to need a suffix:
  *   {"promptForClassicGamertag":false,"classicTranslationLevel":"None",
  *    "uniqueModernGamertag":"NP0R#9401","modernGamertagSuffix":"9401",
  *    "modernGamertag":"NP0R","gamertag":"NP0R9401"}
  *
- * Three earlier attempts at this all guessed the fields `classicGamertag`
- * and `gamertagSuffix` — neither exists in a real response, which is why
- * every one of those attempts silently detected nothing. The real fields
- * are `classicTranslationLevel` (== "None" when no classic name exists at
- * all) and `modernGamertagSuffix` (the suffix Xbox actually assigned).
- * `gamertag` is the final assigned name with the suffix concatenated
- * (no separator), not the exact classic name.
+ * Critical realization from the request shape: this call answers "what
+ * MODERN gamertag would this become" — so `modernGamertagSuffix` /
+ * `uniqueModernGamertag` are populated on essentially EVERY response,
+ * suffixed or not, because that's what a modern gamertag inherently is (a
+ * base name plus an assigned suffix). Treating their presence as "suffix
+ * required" (what the previous fix did) is why that fix false-flagged
+ * literally every hit, including names independently confirmed unowned —
+ * the field is not a signal, it's just always there.
  *
- * Not yet confirmed live: what a genuinely classic-available response looks
- * like (only a suffixed case has been captured so far). Presumed by
- * elimination: no suffix assigned and classicTranslationLevel not "None".
+ * The actual signal for whether a classic (no-suffix) slot exists at all is
+ * `promptForClassicGamertag`: true only when Xbox's own UI would offer the
+ * user a choice between the classic and modern spelling, i.e. a classic
+ * slot is available. `classicTranslationLevel === "None"` corroborates it
+ * (also seen "None" on the one confirmed suffix-required capture).
+ *
+ * Earlier attempts also sent the wrong REQUEST body entirely
+ * (`classicGamertag`/`targetGamertagFields: "classicGamertag"`, a guess
+ * from the project's claim-flow notes, never actually verified against
+ * real traffic) — probeGamertagReservation() below now matches the
+ * confirmed real request shape.
  */
 export function parseReserveSuffix(body: string, gamertag: string): ReserveSuffixInfo {
   try {
     const r = JSON.parse(body) as {
+      promptForClassicGamertag?: boolean;
       classicTranslationLevel?: string;
       modernGamertagSuffix?: string;
       modernGamertag?: string;
       uniqueModernGamertag?: string;
       gamertag?: string;
-      // Kept in case a classic-available response does carry this field —
-      // harmless to also check for it.
       classicGamertag?: string;
     };
+    if (r.promptForClassicGamertag === true) {
+      return { suffixed: false, offered: r.classicGamertag ?? gamertag };
+    }
     const suffix = (r.modernGamertagSuffix ?? "").trim();
-    const noClassicSlot = r.classicTranslationLevel === "None";
-    if (suffix || noClassicSlot) {
-      return {
-        suffixed: true,
-        offered: r.uniqueModernGamertag ?? r.gamertag ?? (r.modernGamertag && suffix ? `${r.modernGamertag}#${suffix}` : undefined),
-        suffix: suffix || undefined,
-      };
-    }
-    if (r.classicGamertag && !sameTag(r.classicGamertag, gamertag)) {
-      return { suffixed: true, offered: r.classicGamertag };
-    }
-    return { suffixed: false, offered: r.classicGamertag ?? r.gamertag };
+    return {
+      suffixed: true,
+      offered: r.uniqueModernGamertag ?? r.gamertag ?? (r.modernGamertag && suffix ? `${r.modernGamertag}#${suffix}` : undefined),
+      suffix: suffix || undefined,
+    };
   } catch {
     return { suffixed: false };
   }
@@ -466,10 +475,15 @@ export async function probeGamertagReservation(
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       await waitForProbeSlot(id, signal);
+      // Matches the CONFIRMED real request Xbox's own site sends when you
+      // type a candidate name (captured live traffic) — not the
+      // classicGamertag-targeted guess this used before, which appears to
+      // have caused Xbox to always answer with modern-gamertag fields
+      // regardless of real classic availability.
       const reserve = await send(RESERVE_URL, ctx.authHeader, {
-        classicGamertag: gamertag,
+        modernGamertag: gamertag,
         reservationId: ctx.xuid,
-        targetGamertagFields: "classicGamertag",
+        targetGamertagFields: "modernGamertag",
       }, RESERVE_TIMEOUT_MS);
       logger.debug({ gamertag, endpoint: "reserve", status: reserve.status, body: snippet(reserve.text) }, "xbox_probe");
 
