@@ -264,7 +264,12 @@ async function runSearch(session: Session): Promise<void> {
       broadcastSSE(session, "result", { ...result, cps, attempts: session.attempts, found: session.found });
 
       const elapsed = Date.now() - checkStart;
-      const remaining = minIntervalMs - elapsed;
+      // A little jitter (±15%) around the target interval: a perfectly
+      // uniform gap between requests is itself an automation signal, and
+      // jitter is zero-sum on the configured rate over any real stretch of
+      // checks — some gaps a bit shorter, some a bit longer, same average.
+      const jitteredInterval = minIntervalMs * (0.85 + Math.random() * 0.3);
+      const remaining = jitteredInterval - elapsed;
       if (remaining > 0) await sleep(remaining);
     }
   }

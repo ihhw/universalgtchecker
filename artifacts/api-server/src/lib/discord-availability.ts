@@ -52,23 +52,45 @@ function channelFor(host: string): string {
   return "stable";
 }
 
-function superProperties(host: string): string {
-  const props = {
-    os: "Windows",
-    browser: "Discord Client",
-    release_channel: channelFor(host),
-    client_version: "1.0.9166",
-    os_version: "10.0.22631",
-    os_arch: "x64",
-    system_locale: "en-US",
-    client_build_number: randomBuildNumber(270_000, 275_000),
-    native_build_number: randomBuildNumber(43_000, 45_000),
-    client_event_source: null,
-  };
-  return Buffer.from(JSON.stringify(props)).toString("base64");
+/**
+ * A stable, per-identity set of headers. A real Discord install keeps the
+ * same client/installation fingerprint for as long as it's running —
+ * regenerating it on every request (the previous behaviour here) is a
+ * *stronger* automation signal than keeping it fixed, since no real client
+ * churns its own identity between consecutive calls. One of these is built
+ * once per proxy (see identityFor) and reused for every check routed
+ * through it, the same way one real, persistent installation would.
+ */
+interface Identity {
+  superPropertiesByHost: Map<string, string>;
+  fingerprint: string;
+  userAgent: string;
 }
 
-function fingerprint(): string {
+const CHROME_VERSIONS = ["120.0.0.0", "121.0.0.0", "122.0.0.0", "123.0.0.0"];
+
+function buildIdentity(): Identity {
+  const clientBuild = randomBuildNumber(270_000, 275_000);
+  const nativeBuild = randomBuildNumber(43_000, 45_000);
+  const chrome = CHROME_VERSIONS[Math.floor(Math.random() * CHROME_VERSIONS.length)]!;
+
+  const superPropertiesByHost = new Map<string, string>();
+  for (const host of HOSTS) {
+    const props = {
+      os: "Windows",
+      browser: "Discord Client",
+      release_channel: channelFor(host),
+      client_version: "1.0.9166",
+      os_version: "10.0.22631",
+      os_arch: "x64",
+      system_locale: "en-US",
+      client_build_number: clientBuild,
+      native_build_number: nativeBuild,
+      client_event_source: null,
+    };
+    superPropertiesByHost.set(host, Buffer.from(JSON.stringify(props)).toString("base64"));
+  }
+
   const fp = {
     os: "Windows",
     browser: "Discord Client",
@@ -77,26 +99,84 @@ function fingerprint(): string {
     os_version: "10.0.22631",
     os_arch: "x64",
     system_locale: "en-US",
-    client_build_number: randomBuildNumber(270_000, 275_000),
-    native_build_number: randomBuildNumber(43_000, 45_000),
+    client_build_number: clientBuild,
+    native_build_number: nativeBuild,
   };
-  return Buffer.from(JSON.stringify(fp)).toString("base64");
+
+  return {
+    superPropertiesByHost,
+    fingerprint: Buffer.from(JSON.stringify(fp)).toString("base64"),
+    userAgent: `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${chrome} Safari/537.36`,
+  };
 }
 
-function headersFor(host: string): Record<string, string> {
+/** One identity per proxy (persistent), plus one for the no-proxy path. */
+const identities = new Map<string, Identity>();
+const NO_PROXY_KEY = "__direct__";
+
+function identityFor(key: string): Identity {
+  let identity = identities.get(key);
+  if (!identity) {
+    identity = buildIdentity();
+    identities.set(key, identity);
+  }
+  return identity;
+}
+
+function headersFor(host: string, identity: Identity): Record<string, string> {
   return {
     accept: "*/*",
     "accept-language": "en-US,en;q=0.9",
     "content-type": "application/json",
     origin: "https://discord.com",
     referer: "https://discord.com/channels/@me",
-    "user-agent":
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "user-agent": identity.userAgent,
     "x-discord-locale": "en-US",
     "x-discord-timezone": "America/New_York",
-    "x-super-properties": superProperties(host),
-    "x-fingerprint": fingerprint(),
+    "x-super-properties": identity.superPropertiesByHost.get(host)!,
+    "x-fingerprint": identity.fingerprint,
   };
+}
+
+/** Parses Retry-After (seconds or an HTTP date) into ms, clamped to a sane range. */
+export function retryAfterMs(headers: Headers, fallbackMs: number): number {
+  const raw = headers.get("retry-after");
+  if (!raw) return fallbackMs;
+  const secs = Number(raw);
+  if (Number.isFinite(secs)) return Math.min(Math.max(250, secs * 1_000), 60_000);
+  const at = Date.parse(raw);
+  if (Number.isFinite(at)) return Math.min(Math.max(250, at - Date.now()), 60_000);
+  return fallbackMs;
+}
+
+/**
+ * Proactive bucket awareness, mirrored per proxy (or globally for the
+ * no-proxy path): when a response says only a couple of requests are left
+ * before the bucket resets, the next check on that route waits for the
+ * reset instead of firing straight into a 429 — Discord's own signal is
+ * more precise than reacting after the fact.
+ */
+interface BucketState {
+  remaining: number;
+  resetAt: number;
+}
+const buckets = new Map<string, BucketState>();
+
+function noteBucketHeaders(key: string, headers: Headers): void {
+  const remaining = headers.get("x-ratelimit-remaining");
+  const resetAfter = headers.get("x-ratelimit-reset-after");
+  if (remaining === null || resetAfter === null) return;
+  const remainingNum = Number(remaining);
+  const resetAfterNum = Number(resetAfter);
+  if (!Number.isFinite(remainingNum) || !Number.isFinite(resetAfterNum)) return;
+  buckets.set(key, { remaining: remainingNum, resetAt: Date.now() + resetAfterNum * 1_000 });
+}
+
+function bucketWaitMs(key: string): number {
+  const b = buckets.get(key);
+  if (!b) return 0;
+  if (b.resetAt <= Date.now()) return 0;
+  return b.remaining <= 1 ? b.resetAt - Date.now() : 0;
 }
 
 /**
@@ -108,10 +188,11 @@ let consecutive429 = 0;
 const CIRCUIT_THRESHOLD = 4;
 const CIRCUIT_BREAK_MS = 8_000;
 
-function noteRateLimited(): void {
+function noteRateLimited(extraMs = 0): void {
   consecutive429++;
+  if (extraMs > 0) cooldownUntil = Math.max(cooldownUntil, Date.now() + extraMs);
   if (consecutive429 >= CIRCUIT_THRESHOLD) {
-    cooldownUntil = Date.now() + CIRCUIT_BREAK_MS;
+    cooldownUntil = Math.max(cooldownUntil, Date.now() + CIRCUIT_BREAK_MS);
     consecutive429 = 0;
   }
 }
@@ -120,7 +201,7 @@ function noteOk(): void {
 }
 
 export function msUntilReady(): number {
-  return Math.max(0, cooldownUntil - Date.now());
+  return Math.max(0, cooldownUntil - Date.now(), bucketWaitMs(NO_PROXY_KEY));
 }
 
 /**
@@ -151,26 +232,38 @@ function pickProxy(proxies: string[]): string | null {
     const idx = (proxyCursor + i) % proxies.length;
     const candidate = proxies[idx]!;
     const state = proxyStates.get(candidate);
-    if (!state || state.deadUntil <= now) {
+    const bucketWait = bucketWaitMs(candidate);
+    if ((!state || state.deadUntil <= now) && bucketWait <= 0) {
       proxyCursor = idx + 1;
       return candidate;
     }
   }
-  // Every proxy is cooling down: use one anyway rather than stalling entirely.
-  const candidate = proxies[proxyCursor % proxies.length]!;
+  // Every proxy is cooling down: use the one that frees up soonest rather
+  // than stalling entirely.
+  let best = proxies[proxyCursor % proxies.length]!;
+  let bestReady = Infinity;
+  for (const p of proxies) {
+    const state = proxyStates.get(p);
+    const ready = Math.max(state?.deadUntil ?? 0, Date.now() + bucketWaitMs(p));
+    if (ready < bestReady) { bestReady = ready; best = p; }
+  }
   proxyCursor++;
-  return candidate;
+  return best;
 }
 
 const PROXY_DEAD_STRIKES = 3;
 const PROXY_DEAD_COOLDOWN_MS = 30_000;
+/** 401/403 usually means the proxy itself is bad (dead, blocked, needs auth we don't have), not a temporary limit. */
+const PROXY_AUTH_FAIL_COOLDOWN_MS = 60_000;
 
-function markProxyFail(proxy: string): void {
+function markProxyFail(proxy: string, cooldownMs = 0): void {
   const state = proxyStates.get(proxy) ?? { deadUntil: 0, consecutiveFail: 0 };
   state.consecutiveFail++;
-  if (state.consecutiveFail >= PROXY_DEAD_STRIKES) {
-    state.deadUntil = Date.now() + PROXY_DEAD_COOLDOWN_MS;
-    state.consecutiveFail = 0;
+  const strikeCooldown = state.consecutiveFail >= PROXY_DEAD_STRIKES ? PROXY_DEAD_COOLDOWN_MS : 0;
+  const effective = Math.max(cooldownMs, strikeCooldown);
+  if (effective > 0) {
+    state.deadUntil = Math.max(state.deadUntil, Date.now() + effective);
+    if (strikeCooldown > 0) state.consecutiveFail = 0;
   }
   proxyStates.set(proxy, state);
 }
@@ -181,21 +274,20 @@ function markProxyOk(proxy: string): void {
 export async function checkDiscordUsername(username: string, signal: AbortSignal): Promise<ResultStatus> {
   const proxies = getProxies();
   const proxy = pickProxy(proxies);
+  const routeKey = proxy ?? NO_PROXY_KEY;
 
-  // The shared, no-proxy circuit breaker only applies when every check comes
-  // from this server's one IP; with a pool, a single bad proxy shouldn't
-  // pause every other in-flight check.
-  if (!proxy) {
-    const wait = msUntilReady();
-    if (wait > 0) {
-      await new Promise<void>((resolve) => {
-        const t = setTimeout(resolve, Math.min(wait, 3_000));
-        signal.addEventListener("abort", () => { clearTimeout(t); resolve(); }, { once: true });
-      });
-    }
+  // Wait out a known bucket exhaustion or (no-proxy only) the shared circuit
+  // breaker before spending a request that would just come back 429.
+  const wait = proxy ? bucketWaitMs(proxy) : msUntilReady();
+  if (wait > 0) {
+    await new Promise<void>((resolve) => {
+      const t = setTimeout(resolve, Math.min(wait, 3_000));
+      signal.addEventListener("abort", () => { clearTimeout(t); resolve(); }, { once: true });
+    });
   }
 
   const host = HOSTS[Math.floor(Math.random() * HOSTS.length)]!;
+  const identity = identityFor(routeKey);
   let dispatcher: Dispatcher | undefined;
   try {
     if (proxy) dispatcher = agentFor(proxy);
@@ -208,10 +300,12 @@ export async function checkDiscordUsername(username: string, signal: AbortSignal
     const res = await undiciFetch(host + PATH, {
       method: "POST",
       signal,
-      headers: headersFor(host),
+      headers: headersFor(host, identity),
       body: JSON.stringify({ username }),
       dispatcher,
     });
+
+    noteBucketHeaders(routeKey, res.headers as unknown as Headers);
 
     let body = "";
     try { body = await res.text(); } catch { /* ignore */ }
@@ -220,8 +314,13 @@ export async function checkDiscordUsername(username: string, signal: AbortSignal
       if (proxy) markProxyFail(proxy); else noteRateLimited();
       return "unknown";
     }
-    if (res.status === 429 || res.status === 401 || res.status === 403) {
-      if (proxy) markProxyFail(proxy); else noteRateLimited();
+    if (res.status === 429) {
+      const retryMs = retryAfterMs(res.headers as unknown as Headers, proxy ? PROXY_DEAD_COOLDOWN_MS : CIRCUIT_BREAK_MS);
+      if (proxy) markProxyFail(proxy, retryMs); else noteRateLimited(retryMs);
+      return "unknown";
+    }
+    if (res.status === 401 || res.status === 403) {
+      if (proxy) markProxyFail(proxy, PROXY_AUTH_FAIL_COOLDOWN_MS); else noteRateLimited();
       return "unknown";
     }
     if (!res.ok) {
