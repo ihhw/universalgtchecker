@@ -585,11 +585,19 @@ export async function probeGamertagReservation(
       // classicGamertag-targeted guess this used before, which appears to
       // have caused Xbox to always answer with modern-gamertag fields
       // regardless of real classic availability.
+      // Real logs show contract-version "1" (the old default here) makes
+      // Xbox reject `targetGamertagFields: "modernGamertag"` outright with
+      // HTTP 400 / code 1017 "Invalid target gamertag fields" on literally
+      // every attempt -- version 1 predates the modern-gamertag field and
+      // doesn't recognize it. The confirmed-working change/commit call
+      // below already uses version 3; use the same version here so the
+      // reserve call is validated against a contract that actually knows
+      // about `modernGamertag`.
       const reserve = await send(RESERVE_URL, ctx.authHeader, {
         modernGamertag: gamertag,
         reservationId: ctx.xuid,
         targetGamertagFields: "modernGamertag",
-      }, RESERVE_TIMEOUT_MS);
+      }, RESERVE_TIMEOUT_MS, { contractVersion: "3" });
       logger.debug({ gamertag, endpoint: "reserve", status: reserve.status, body: snippet(reserve.text) }, "xbox_probe");
 
       const rs = reserve.status;
@@ -620,6 +628,20 @@ export async function probeGamertagReservation(
         return { status: "taken", httpStatus: rs, message: "Xbox reports this gamertag is taken or reserved by someone else." };
       }
       if (rs === 400) {
+        // Distinguish a real "this name is invalid/taken" 400 from a
+        // request-validation error on OUR body (e.g. code 1017 "Invalid
+        // target gamertag fields", seen on every attempt while the reserve
+        // call was sent under the wrong contract version). The latter is a
+        // bug in our request, not a real Xbox verdict -- mapping it to
+        // "taken" was silently mis-reporting every genuine hit as taken.
+        let code: number | undefined;
+        try { code = (JSON.parse(reserve.text) as { code?: number }).code; } catch { /* not JSON */ }
+        if (code === 1017) {
+          return {
+            status: "error", httpStatus: rs,
+            message: "Xbox rejected the reservation probe's request format (code 1017) -- not a real availability answer.",
+          };
+        }
         return { status: "taken", httpStatus: rs, message: "Xbox rejected this gamertag." };
       }
       if (rs !== 200 && rs !== 201 && rs !== 204) {
