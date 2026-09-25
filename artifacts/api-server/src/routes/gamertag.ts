@@ -337,7 +337,8 @@ async function runSearch(session: Session): Promise<void> {
             // since Double Check answers a different question (content
             // policy) and does not carry suffix info.
             if (status === "available") {
-              const probeResult = await probeGamertagReservation(gt);
+              const probeSignal = AbortSignal.any([abort.signal, AbortSignal.timeout(20_000)]);
+              const probeResult = await probeGamertagReservation(gt, undefined, probeSignal);
               if (probeResult.status !== "available") {
                 status = "unknown";
                 policy = {

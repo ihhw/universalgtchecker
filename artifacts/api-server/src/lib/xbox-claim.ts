@@ -51,6 +51,76 @@ import { logAudit } from "./audit";
 
 const GAMERTAG_HOST = "https://gamertag.xboxlive.com";
 const RESERVE_URL   = `${GAMERTAG_HOST}/gamertags/reserve`;
+
+/**
+ * Spacing between reservation-probe requests, tracked per account — mirrors
+ * the Double Check policy endpoint's own adaptive spacing in
+ * xbox-availability.ts (same class of endpoint, gamertag.xboxlive.com).
+ *
+ * The probe used to fire one reserve call per hit with no throttling of its
+ * own at all. Under bulk concurrent checking, that meant every worker that
+ * hit "available" fired a reserve call immediately, all converging on the
+ * SAME account (probes don't mark an account busy, so automatic selection
+ * kept picking the same free one) — a burst far beyond what this endpoint
+ * can sustain, producing widespread 429s that got reported back as
+ * "unknown" en masse. Serializing per-account with adaptive spacing (plus a
+ * retry instead of giving up on the first 429) fixes that.
+ */
+const PROBE_SPACING_FLOOR_MS = 350;
+const PROBE_SPACING_CAP_MS = 8_000;
+const PROBE_RELAX_AFTER_OK = 5;
+
+interface AccountProbeState {
+  spacingMs: number;
+  consecutiveOk: number;
+  lastRequestAt: number;
+  queue: Promise<void>;
+}
+const probeStateByAccount = new Map<string, AccountProbeState>();
+
+function probeStateFor(accountId: string): AccountProbeState {
+  let state = probeStateByAccount.get(accountId);
+  if (!state) {
+    state = { spacingMs: PROBE_SPACING_FLOOR_MS, consecutiveOk: 0, lastRequestAt: 0, queue: Promise.resolve() };
+    probeStateByAccount.set(accountId, state);
+  }
+  return state;
+}
+
+function wait(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve) => {
+    if (signal?.aborted) { resolve(); return; }
+    const t = setTimeout(resolve, ms);
+    signal?.addEventListener("abort", () => { clearTimeout(t); resolve(); }, { once: true });
+  });
+}
+
+function raiseProbeSpacing(accountId: string, ms: number): void {
+  const state = probeStateFor(accountId);
+  state.spacingMs = Math.min(PROBE_SPACING_CAP_MS, Math.max(state.spacingMs, ms));
+  state.consecutiveOk = 0;
+}
+
+function noteProbeOk(accountId: string): void {
+  const state = probeStateFor(accountId);
+  if (state.spacingMs <= PROBE_SPACING_FLOOR_MS) return;
+  state.consecutiveOk++;
+  if (state.consecutiveOk >= PROBE_RELAX_AFTER_OK) {
+    state.spacingMs = Math.max(PROBE_SPACING_FLOOR_MS, Math.round(state.spacingMs * 0.7));
+    state.consecutiveOk = 0;
+  }
+}
+
+function waitForProbeSlot(accountId: string, signal?: AbortSignal): Promise<void> {
+  const state = probeStateFor(accountId);
+  const acquire = state.queue.then(async () => {
+    const delay = Math.max(0, state.spacingMs - (Date.now() - state.lastRequestAt));
+    if (delay > 0) await wait(delay, signal);
+    if (!signal?.aborted) state.lastRequestAt = Date.now();
+  });
+  state.queue = acquire.catch(() => undefined);
+  return acquire;
+}
 // Confirmed against live Xbox: gamertag.xboxlive.com/users/xuid(<xuid>)/gamertag
 // does not exist (HTTP 404). This is the endpoint Xbox's own apps use for the
 // change step, per reverse-engineered Xbox Live traffic (OpenXbox xbox-webapi
@@ -377,6 +447,7 @@ export interface ReservationProbeResult {
 export async function probeGamertagReservation(
   gamertag: string,
   accountId?: AccountSelection,
+  signal?: AbortSignal,
 ): Promise<ReservationProbeResult> {
   const selection = selectAccountForClaim(accountId);
   if (!selection.ok) {
@@ -392,47 +463,58 @@ export async function probeGamertagReservation(
   const ctx = await getClaimContext(id);
   if (!ctx.ok) return { status: "auth_required", message: ctx.reason };
 
-  try {
-    const reserve = await send(RESERVE_URL, ctx.authHeader, {
-      classicGamertag: gamertag,
-      reservationId: ctx.xuid,
-      targetGamertagFields: "classicGamertag",
-    }, RESERVE_TIMEOUT_MS);
-    logger.debug({ gamertag, endpoint: "reserve", status: reserve.status, body: snippet(reserve.text) }, "xbox_probe");
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      await waitForProbeSlot(id, signal);
+      const reserve = await send(RESERVE_URL, ctx.authHeader, {
+        classicGamertag: gamertag,
+        reservationId: ctx.xuid,
+        targetGamertagFields: "classicGamertag",
+      }, RESERVE_TIMEOUT_MS);
+      logger.debug({ gamertag, endpoint: "reserve", status: reserve.status, body: snippet(reserve.text) }, "xbox_probe");
 
-    const rs = reserve.status;
-    if (rs === 429) {
-      return { status: "rate_limited", httpStatus: rs, message: "Xbox rate-limited the reservation probe." };
-    }
-    if (rs === 401 || rs === 403) {
-      return { status: "auth_required", httpStatus: rs, message: "Xbox rejected this account's authorization for the reservation probe." };
-    }
-    if (rs === 409) {
-      return { status: "taken", httpStatus: rs, message: "Xbox reports this gamertag is taken or reserved by someone else." };
-    }
-    if (rs === 400) {
-      return { status: "taken", httpStatus: rs, message: "Xbox rejected this gamertag." };
-    }
-    if (rs !== 200 && rs !== 201 && rs !== 204) {
-      return { status: "error", httpStatus: rs, message: `Unexpected reservation probe response HTTP ${rs}.` };
-    }
+      const rs = reserve.status;
+      if (rs === 429) {
+        const backoffMs = retryAfterMs(reserve.headers, 2_000);
+        raiseProbeSpacing(id, backoffMs);
+        if (attempt === 0) {
+          await wait(backoffMs, signal);
+          continue;
+        }
+        return { status: "rate_limited", httpStatus: rs, message: "Xbox rate-limited the reservation probe." };
+      }
+      noteProbeOk(id);
+      if (rs === 401 || rs === 403) {
+        return { status: "auth_required", httpStatus: rs, message: "Xbox rejected this account's authorization for the reservation probe." };
+      }
+      if (rs === 409) {
+        return { status: "taken", httpStatus: rs, message: "Xbox reports this gamertag is taken or reserved by someone else." };
+      }
+      if (rs === 400) {
+        return { status: "taken", httpStatus: rs, message: "Xbox rejected this gamertag." };
+      }
+      if (rs !== 200 && rs !== 201 && rs !== 204) {
+        return { status: "error", httpStatus: rs, message: `Unexpected reservation probe response HTTP ${rs}.` };
+      }
 
-    const check = parseReserveSuffix(reserve.text, gamertag);
-    if (check.suffixed) {
+      const check = parseReserveSuffix(reserve.text, gamertag);
+      if (check.suffixed) {
+        return {
+          status: "suffix_required",
+          httpStatus: rs,
+          message: `Xbox would only offer "${check.offered ?? gamertag}", not the exact "${gamertag}".`,
+        };
+      }
+      return { status: "available", httpStatus: rs };
+    } catch (err) {
+      const kind = errorKind(err);
       return {
-        status: "suffix_required",
-        httpStatus: rs,
-        message: `Xbox would only offer "${check.offered ?? gamertag}", not the exact "${gamertag}".`,
+        status: "error",
+        message: kind === "timeout" ? "The reservation probe timed out." : "Could not reach Xbox for the reservation probe.",
       };
     }
-    return { status: "available", httpStatus: rs };
-  } catch (err) {
-    const kind = errorKind(err);
-    return {
-      status: "error",
-      message: kind === "timeout" ? "The reservation probe timed out." : "Could not reach Xbox for the reservation probe.",
-    };
   }
+  return { status: "rate_limited", message: "Xbox rate-limited the reservation probe." };
 }
 
 // ─── Claim ────────────────────────────────────────────────────────────────────
