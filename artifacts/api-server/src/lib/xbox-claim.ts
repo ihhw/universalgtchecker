@@ -266,6 +266,66 @@ function sameTag(a: string | null | undefined, b: string): boolean {
   return typeof a === "string" && a.trim().toUpperCase() === b.trim().toUpperCase();
 }
 
+export interface ReserveSuffixInfo {
+  /** True when Xbox will only offer this name with a suffix attached (no classic slot free). */
+  suffixed: boolean;
+  /** The name Xbox actually offered (with suffix if any), for messages. */
+  offered?: string;
+  suffix?: string;
+}
+
+/**
+ * Parses gamertag.xboxlive.com/gamertags/reserve's REAL response shape.
+ *
+ * CONFIRMED against a real live Xbox response (captured 2026-09-25 from
+ * account.xbox.com's own gamertag-change page via browser devtools, for a
+ * name that came back suffix-only):
+ *   {"promptForClassicGamertag":false,"classicTranslationLevel":"None",
+ *    "uniqueModernGamertag":"NP0R#9401","modernGamertagSuffix":"9401",
+ *    "modernGamertag":"NP0R","gamertag":"NP0R9401"}
+ *
+ * Three earlier attempts at this all guessed the fields `classicGamertag`
+ * and `gamertagSuffix` — neither exists in a real response, which is why
+ * every one of those attempts silently detected nothing. The real fields
+ * are `classicTranslationLevel` (== "None" when no classic name exists at
+ * all) and `modernGamertagSuffix` (the suffix Xbox actually assigned).
+ * `gamertag` is the final assigned name with the suffix concatenated
+ * (no separator), not the exact classic name.
+ *
+ * Not yet confirmed live: what a genuinely classic-available response looks
+ * like (only a suffixed case has been captured so far). Presumed by
+ * elimination: no suffix assigned and classicTranslationLevel not "None".
+ */
+export function parseReserveSuffix(body: string, gamertag: string): ReserveSuffixInfo {
+  try {
+    const r = JSON.parse(body) as {
+      classicTranslationLevel?: string;
+      modernGamertagSuffix?: string;
+      modernGamertag?: string;
+      uniqueModernGamertag?: string;
+      gamertag?: string;
+      // Kept in case a classic-available response does carry this field —
+      // harmless to also check for it.
+      classicGamertag?: string;
+    };
+    const suffix = (r.modernGamertagSuffix ?? "").trim();
+    const noClassicSlot = r.classicTranslationLevel === "None";
+    if (suffix || noClassicSlot) {
+      return {
+        suffixed: true,
+        offered: r.uniqueModernGamertag ?? r.gamertag ?? (r.modernGamertag && suffix ? `${r.modernGamertag}#${suffix}` : undefined),
+        suffix: suffix || undefined,
+      };
+    }
+    if (r.classicGamertag && !sameTag(r.classicGamertag, gamertag)) {
+      return { suffixed: true, offered: r.classicGamertag };
+    }
+    return { suffixed: false, offered: r.classicGamertag ?? r.gamertag };
+  } catch {
+    return { suffixed: false };
+  }
+}
+
 function errorKind(err: unknown): "timeout" | "network" {
   const name = err instanceof Error ? err.name : "";
   return name === "TimeoutError" || name === "AbortError" ? "timeout" : "network";
@@ -289,6 +349,90 @@ async function send(
   });
   const text = await res.text().catch(() => "");
   return { status: res.status, headers: res.headers, text };
+}
+
+// ─── Reservation probe ──────────────────────────────────────────────────────
+//
+// A non-destructive availability check using ONLY the reserve call (step 1
+// of the real claim flow, never the change/commit step). This is the same
+// call Xbox's own account.xbox.com gamertag-change page fires live as you
+// type a candidate name, before you ever hit Save -- confirmed by capturing
+// its real network traffic -- so it's safe to call repeatedly and does not
+// commit or hold anything.
+//
+// Two earlier attempts at this parsed the WRONG response fields
+// (classicGamertag/gamertagSuffix, which don't exist) and so never actually
+// detected a suffix. parseReserveSuffix() above uses the real fields,
+// confirmed from a captured live Xbox response.
+
+export type ReservationProbeStatus =
+  | "available" | "taken" | "suffix_required" | "auth_required" | "rate_limited" | "error";
+
+export interface ReservationProbeResult {
+  status: ReservationProbeStatus;
+  message?: string;
+  httpStatus?: number;
+}
+
+export async function probeGamertagReservation(
+  gamertag: string,
+  accountId?: AccountSelection,
+): Promise<ReservationProbeResult> {
+  const selection = selectAccountForClaim(accountId);
+  if (!selection.ok) {
+    return { status: selection.kind === "busy" ? "error" : "auth_required", message: selection.reason };
+  }
+  const id = selection.accountId;
+  // Never probe an account mid a real claim — a probe's own reserve call
+  // could otherwise land in between that claim's reserve and change steps.
+  if (claimInProgress(id)) {
+    return { status: "error", message: "This account has a claim in progress; skipped the probe." };
+  }
+
+  const ctx = await getClaimContext(id);
+  if (!ctx.ok) return { status: "auth_required", message: ctx.reason };
+
+  try {
+    const reserve = await send(RESERVE_URL, ctx.authHeader, {
+      classicGamertag: gamertag,
+      reservationId: ctx.xuid,
+      targetGamertagFields: "classicGamertag",
+    }, RESERVE_TIMEOUT_MS);
+    logger.debug({ gamertag, endpoint: "reserve", status: reserve.status, body: snippet(reserve.text) }, "xbox_probe");
+
+    const rs = reserve.status;
+    if (rs === 429) {
+      return { status: "rate_limited", httpStatus: rs, message: "Xbox rate-limited the reservation probe." };
+    }
+    if (rs === 401 || rs === 403) {
+      return { status: "auth_required", httpStatus: rs, message: "Xbox rejected this account's authorization for the reservation probe." };
+    }
+    if (rs === 409) {
+      return { status: "taken", httpStatus: rs, message: "Xbox reports this gamertag is taken or reserved by someone else." };
+    }
+    if (rs === 400) {
+      return { status: "taken", httpStatus: rs, message: "Xbox rejected this gamertag." };
+    }
+    if (rs !== 200 && rs !== 201 && rs !== 204) {
+      return { status: "error", httpStatus: rs, message: `Unexpected reservation probe response HTTP ${rs}.` };
+    }
+
+    const check = parseReserveSuffix(reserve.text, gamertag);
+    if (check.suffixed) {
+      return {
+        status: "suffix_required",
+        httpStatus: rs,
+        message: `Xbox would only offer "${check.offered ?? gamertag}", not the exact "${gamertag}".`,
+      };
+    }
+    return { status: "available", httpStatus: rs };
+  } catch (err) {
+    const kind = errorKind(err);
+    return {
+      status: "error",
+      message: kind === "timeout" ? "The reservation probe timed out." : "Could not reach Xbox for the reservation probe.",
+    };
+  }
 }
 
 // ─── Claim ────────────────────────────────────────────────────────────────────
@@ -442,16 +586,13 @@ export async function claimGamertag(
       });
     }
     // A successful reservation must be for the exact name, with no suffix.
-    try {
-      const r = JSON.parse(rBody) as { classicGamertag?: string; gamertag?: string; gamertagSuffix?: string };
-      const reserved = r.classicGamertag ?? r.gamertag;
-      if ((r.gamertagSuffix && r.gamertagSuffix.trim()) || (reserved && !sameTag(reserved, gamertag))) {
-        return finish("claim_failed", {
-          ...base, errorCode: "suffix_required",
-          reason: `Xbox would only reserve "${reserved ?? gamertag}${r.gamertagSuffix ? `#${r.gamertagSuffix}` : ""}", not the exact "${gamertag}". Claim aborted.`,
-        });
-      }
-    } catch { /* empty/non-JSON body: the status code is the confirmation */ }
+    const reserveSuffix = parseReserveSuffix(rBody, gamertag);
+    if (reserveSuffix.suffixed) {
+      return finish("claim_failed", {
+        ...base, errorCode: "suffix_required",
+        reason: `Xbox would only reserve "${reserveSuffix.offered ?? gamertag}", not the exact "${gamertag}". Claim aborted.`,
+      });
+    }
 
     // ── 2. Change ──────────────────────────────────────────────────────────
     const tChange = now();

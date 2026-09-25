@@ -97,7 +97,41 @@ test("auto-claim OFF → hits are reported, nothing is claimed; Double Check OFF
   const statuses = Object.fromEntries(snap.results.map((r: any) => [r.gamertag, `${r.status}/${r.alertable}`]));
   assert.deepEqual(statuses, { TakenTag: "taken/false", FreeOnly: "available/true" });
   assert.equal(calls("policy").length, 0);
-  assert.equal(calls("reserve").length, 0);
+});
+
+test("Double Check OFF: the reserve probe still catches a suffix-only offer, using Xbox's real response fields → UNKNOWN, not alertable", async () => {
+  // Real Xbox response shape (captured live from account.xbox.com):
+  // {"promptForClassicGamertag":false,"classicTranslationLevel":"None",
+  //  "uniqueModernGamertag":"NP0R#9401","modernGamertagSuffix":"9401",
+  //  "modernGamertag":"NP0R","gamertag":"NP0R9401"} — no classicGamertag/
+  // gamertagSuffix fields at all, which is what the first three attempts at
+  // this wrongly assumed existed.
+  await control(mock.url, {
+    sticky: {
+      reserve: {
+        status: 200,
+        body: {
+          promptForClassicGamertag: false, classicTranslationLevel: "None",
+          uniqueModernGamertag: "SUFTAG#9401", modernGamertagSuffix: "9401",
+          modernGamertag: "SUFTAG", gamertag: "SUFTAG9401",
+        },
+      },
+    },
+  });
+  const { snap } = await runList(["SufTag"], { autoClaim: false });
+  const r = snap.results[0];
+  assert.equal(r.status, "unknown");
+  assert.equal(r.policy.status, "unavailable");
+  assert.match(r.policy.message, /SUFTAG#9401/);
+  assert.equal(r.alertable, false);
+});
+
+test("Double Check OFF: the reserve probe confirms a genuinely free classic name → still APPROVED", async () => {
+  const { snap } = await runList(["FreeOnly2"], { autoClaim: false });
+  const r = snap.results[0];
+  assert.equal(r.status, "available");
+  assert.equal(r.alertable, true);
+  assert.equal(calls("reserve").length, 1);
 });
 
 test("POST /gamertag/claim: status codes and response shape (bot-compatible), no secrets", async () => {

@@ -195,7 +195,11 @@ export function startMockXbox(port = 0): Promise<{ url: string; state: MockState
           if (!gt || rid !== state.xuid) { send(400, { description: "Bad reservation request" }); return; }
           if (state.taken.has(gt.toUpperCase())) { send(409, { description: "Gamertag is not available" }); return; }
           state.reservations.set(gt.toUpperCase(), rid);
-          send(200, { classicGamertag: gt, gamertag: gt, gamertagSuffix: "", modernGamertag: gt, uniqueModernGamertag: gt });
+          // Real Xbox response shape (confirmed via captured live traffic):
+          // no separate classicGamertag/gamertagSuffix fields. A free
+          // classic name comes back with classicTranslationLevel not
+          // "None" and no modernGamertagSuffix.
+          send(200, { promptForClassicGamertag: false, classicTranslationLevel: "Full", modernGamertag: gt, uniqueModernGamertag: gt, modernGamertagSuffix: "", gamertag: gt });
           return;
         }
         case "change": {

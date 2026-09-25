@@ -17,7 +17,7 @@ import {
   checkGamertag, checkViaAvailabilityEndpoint, checkViaCDN, runEthanPolicyCheck,
   type PolicyStatus, type ResultStatus,
 } from "../lib/xbox-availability";
-import { claimGamertag, listClaims, notifyClaimWebhook, type ClaimRecord } from "../lib/xbox-claim";
+import { claimGamertag, listClaims, notifyClaimWebhook, probeGamertagReservation, type ClaimRecord } from "../lib/xbox-claim";
 import { compileGeneration, type Generator } from "../lib/gamertag-generator";
 import { validateXboxGamertag } from "../lib/xbox-validation";
 import { pushActivity } from "../lib/activity";
@@ -312,37 +312,46 @@ async function runSearch(session: Session): Promise<void> {
           }
           if (reverify !== "available") {
             status = reverify === "taken" ? "taken" : "unknown";
-          } else if (session.runEthanPolicyCheck) {
-            // The policy endpoint may need its own 5-second 429 backoff, so it
-            // gets a fresh budget instead of inheriting the primary check's
-            // already-running 5-second timeout.
-            const policySignal = AbortSignal.any([
-              abort.signal,
-              AbortSignal.timeout(20_000),
-            ]);
-            const policyResult = await runEthanPolicyCheck(gt, policySignal, { fast: true });
-            policy = { status: policyResult.status, message: policyResult.message };
-            // An available result is only alertable after Ethan approves it.
-            // Auth, rate-limit, and network failures must not bypass the
-            // secondary check and accidentally send an unverified tag.
-            if (policyResult.status !== "approved") {
-              status = "unknown";
+          } else {
+            if (session.runEthanPolicyCheck) {
+              // The policy endpoint may need its own 5-second 429 backoff, so it
+              // gets a fresh budget instead of inheriting the primary check's
+              // already-running 5-second timeout.
+              const policySignal = AbortSignal.any([
+                abort.signal,
+                AbortSignal.timeout(20_000),
+              ]);
+              const policyResult = await runEthanPolicyCheck(gt, policySignal, { fast: true });
+              policy = { status: policyResult.status, message: policyResult.message };
+              // An available result is only alertable after Ethan approves it.
+              // Auth, rate-limit, and network failures must not bypass the
+              // secondary check and accidentally send an unverified tag.
+              if (policyResult.status !== "approved") {
+                status = "unknown";
+              }
+            }
+            // Confirms the exact classic (no-suffix) name using the real
+            // field names Xbox's own reserve response uses (confirmed by
+            // capturing live traffic from account.xbox.com's own gamertag
+            // page). Runs on every surviving hit, Double Check on or off,
+            // since Double Check answers a different question (content
+            // policy) and does not carry suffix info.
+            if (status === "available") {
+              const probeResult = await probeGamertagReservation(gt);
+              if (probeResult.status !== "available") {
+                status = "unknown";
+                policy = {
+                  status: "unavailable",
+                  message: probeResult.message ?? "Xbox would only offer this gamertag with a suffix attached.",
+                };
+              }
             }
           }
         }
         // Final alert state. Only a strict primary "available" that is either
-        // not double-checked or explicitly policy-approved is alertable.
-        //
-        // NOTE on gamertag suffixes: neither this check nor Double Check can
-        // tell you whether Xbox will grant the EXACT typed classic (no
-        // suffix) name versus only a suffixed variant. A dedicated probe
-        // that called Xbox's reserve/preview-change endpoints to try to
-        // detect this was removed -- it didn't reliably catch suffix cases,
-        // and reserving/previewing a name can itself put that name on a
-        // temporary hold, which risked making the problem worse rather than
-        // detecting it. "Available" here means "not currently assigned to a
-        // live account" -- always confirm the exact name in the real Xbox
-        // app before relying on it being classic.
+        // not double-checked or explicitly policy-approved is alertable. The
+        // reserve probe above already downgrades a suffix-only offer to
+        // "unknown", so a surviving "available" here has passed it too.
         alertable = status === "available" &&
           (!session.runEthanPolicyCheck || policy?.status === "approved");
       } catch {

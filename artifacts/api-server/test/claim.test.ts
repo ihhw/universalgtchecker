@@ -75,7 +75,17 @@ test("200 but Xbox names a different/suffixed tag → never CLAIMED", async () =
 });
 
 test("reserve 200 with a suffix → CLAIM FAILED before any change request", async () => {
-  await control(mock.url, { queues: { reserve: [{ status: 200, body: { classicGamertag: "Sfx", gamertagSuffix: "42" } }] } });
+  // Real Xbox response shape (confirmed via captured live traffic): no
+  // classicGamertag/gamertagSuffix fields; the real signal is
+  // classicTranslationLevel "None" plus a populated modernGamertagSuffix.
+  await control(mock.url, {
+    queues: {
+      reserve: [{
+        status: 200,
+        body: { classicTranslationLevel: "None", modernGamertag: "Sfx", modernGamertagSuffix: "42", uniqueModernGamertag: "Sfx#42", gamertag: "Sfx42" },
+      }],
+    },
+  });
   const r = await claim.claimGamertag("Sfx", { source: "manual" });
   assert.equal(r.state, "claim_failed");
   assert.equal(r.errorCode, "suffix_required");
