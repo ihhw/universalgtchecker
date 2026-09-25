@@ -67,6 +67,11 @@ interface Session {
   abort:         AbortController;
   sseClients:    Response[];
   recentCheckTs: number[];
+  /** Monotonic counter for GamertagResult.seq — separate from `attempts`
+   *  because a background suffix confirmation (see recordConfirmation)
+   *  pushes a second result for the same candidate without bumping
+   *  `attempts` again. */
+  seqCounter:    number;
 }
 
 const sessions = new Map<string, Session>();
@@ -225,6 +230,11 @@ async function runSearch(session: Session): Promise<void> {
   const sessionTriedOrder: string[] = [];
   let sessionTriedCursor = 0;
   const foundTags: string[] = [];
+  // Background suffix-probe tasks in flight (see pendingSuffixCheck in
+  // worker()). All workers finishing does not mean the search is actually
+  // done — these must settle first, or a legitimate confirmation could
+  // arrive after the SSE stream has already been closed and get lost.
+  const pendingProbes = new Set<Promise<void>>();
 
   function rememberTried(tag: string): void {
     sessionTried.add(tag);
@@ -245,6 +255,73 @@ async function runSearch(session: Session): Promise<void> {
       const t = setTimeout(resolve, ms);
       abort.signal.addEventListener("abort", () => { clearTimeout(t); resolve(); }, { once: true });
     });
+  }
+
+  /**
+   * Records a check's outcome: bumps progress counters, pushes the result,
+   * and (for an alertable hit) fires the found-side-effects. This is the
+   * normal path for every non-pending check, and also how a "pending
+   * verification" placeholder gets recorded — see recordConfirmation for
+   * how a suffix probe's later answer is applied without double-counting.
+   */
+  function recordResult(
+    gt: string, status: ResultStatus, policy: { status: PolicyStatus; message?: string } | undefined, alertable: boolean,
+  ): GamertagResult {
+    session.recentCheckTs.push(Date.now());
+    session.attempts++;
+    if (status === "taken") session.taken++;
+    else if (status !== "available") session.unknown++;
+    session.seqCounter++;
+    const result: GamertagResult = { gamertag: gt, status, policy, alertable, seq: session.seqCounter };
+    session.results.push(result);
+    if (session.results.length > 2_000) session.results.splice(0, session.results.length - 2_000);
+
+    if (status === "available" && alertable) applyHitSideEffects(gt, result);
+
+    pushActivity({
+      username: gt, platform: "xbox", format: session.label,
+      status: status === "available" ? "available" : status === "taken" ? "taken" : "unknown",
+      alertable, policy: policy?.status, sessionId: session.sessionId,
+    });
+
+    const cps = computeCps(session);
+    broadcastSSE(session, "result", { ...result, cps, attempts: session.attempts, found: session.found });
+    return result;
+  }
+
+  function applyHitSideEffects(gt: string, result: GamertagResult): void {
+    session.found++;
+    foundTags.push(gt);
+    appendResultToFile(gt);
+    saveState(session.sessionId, session.label, foundTags);
+    // Do not await the alert: a slow Discord endpoint must never pause
+    // Xbox checking or reduce the configured worker rate.
+    void notifyDiscordWebhook(result, session.label, session.sessionId);
+    // Claim straight from the worker: no browser round trip, so it works
+    // with the tab closed and starts the moment the hit is confirmed.
+    if (session.autoClaim) void autoClaimHit(session, gt);
+  }
+
+  /**
+   * Applies a suffix probe's answer that arrived AFTER the check it belongs
+   * to was already recorded as a provisional "unknown" (see worker() below)
+   * — this is what lets the search keep moving instead of a worker sitting
+   * idle in the probe's queue. Only fires the found side-effects; it does
+   * not touch attempts/taken/unknown, since the provisional record already
+   * counted this candidate once.
+   */
+  function recordConfirmation(gt: string, policy: { status: PolicyStatus; message?: string } | undefined): void {
+    session.seqCounter++;
+    const result: GamertagResult = { gamertag: gt, status: "available", policy, alertable: true, seq: session.seqCounter };
+    session.results.push(result);
+    if (session.results.length > 2_000) session.results.splice(0, session.results.length - 2_000);
+    applyHitSideEffects(gt, result);
+    pushActivity({
+      username: gt, platform: "xbox", format: session.label,
+      status: "available", alertable: true, policy: policy?.status, sessionId: session.sessionId,
+    });
+    const cps = computeCps(session);
+    broadcastSSE(session, "result", { ...result, cps, attempts: session.attempts, found: session.found });
   }
 
   async function worker(): Promise<void> {
@@ -291,7 +368,10 @@ async function runSearch(session: Session): Promise<void> {
       const perCheckSignal = AbortSignal.any([abort.signal, AbortSignal.timeout(5_000)]);
       let status: ResultStatus;
       let policy: { status: PolicyStatus; message?: string } | undefined;
-      let alertable = false;
+      // True once primary check, reverify, and (if on) Double Check have all
+      // passed and only the suffix probe is left. The probe is deliberately
+      // NOT awaited here — see below.
+      let pendingSuffixCheck = false;
       try {
         status = await checkGamertag(gt, perCheckSignal);
         if (status === "available" && shownAvailable.has(gt.toUpperCase())) {
@@ -330,76 +410,65 @@ async function runSearch(session: Session): Promise<void> {
                 status = "unknown";
               }
             }
-            // Confirms the exact classic (no-suffix) name using the real
-            // field names Xbox's own reserve response uses (confirmed by
-            // capturing live traffic from account.xbox.com's own gamertag
-            // page). Runs on every surviving hit, Double Check on or off,
-            // since Double Check answers a different question (content
-            // policy) and does not carry suffix info.
-            if (status === "available") {
-              const probeSignal = AbortSignal.any([abort.signal, AbortSignal.timeout(20_000)]);
-              const probeResult = await probeGamertagReservation(gt, undefined, probeSignal);
-              if (probeResult.status !== "available") {
-                status = "unknown";
-                policy = {
-                  status: "unavailable",
-                  message: probeResult.message ?? "Xbox would only offer this gamertag with a suffix attached.",
-                };
-              }
-            }
+            if (status === "available") pendingSuffixCheck = true;
           }
         }
-        // Final alert state. Only a strict primary "available" that is either
-        // not double-checked or explicitly policy-approved is alertable. The
-        // reserve probe above already downgrades a suffix-only offer to
-        // "unknown", so a surviving "available" here has passed it too.
-        alertable = status === "available" &&
-          (!session.runEthanPolicyCheck || policy?.status === "approved");
       } catch {
         status = "error";
-        alertable = false;
       } finally {
         sem.release();
       }
 
       if (session.state !== "running") return;
 
-      session.recentCheckTs.push(Date.now());
-      session.attempts++;
-      if (status === "taken") session.taken++;
-      else if (status !== "available") session.unknown++;
-      const result: GamertagResult = {
-        gamertag: gt, status, policy, alertable, seq: session.attempts,
-      };
-      session.results.push(result);
-      // Keep the in-memory replay window bounded during an unbounded search.
-      if (session.results.length > 2_000) session.results.splice(0, session.results.length - 2_000);
-
-      if (status === "available" && alertable) {
-        session.found++;
-        foundTags.push(gt);
-        appendResultToFile(gt);
-        saveState(session.sessionId, session.label, foundTags);
-        // Do not await the alert: a slow Discord endpoint must never pause
-        // Xbox checking or reduce the configured worker rate.
-        void notifyDiscordWebhook(result, session.label, session.sessionId);
-        // Claim straight from the worker: no browser round trip, so it works
-        // with the tab closed and starts the moment the hit is confirmed.
-        if (session.autoClaim) void autoClaimHit(session, gt);
+      if (pendingSuffixCheck) {
+        // Confirms the exact classic (no-suffix) name using the real field
+        // names Xbox's own reserve response uses (confirmed by capturing
+        // live traffic from account.xbox.com's own gamertag page). Runs on
+        // every surviving hit, Double Check on or off, since Double Check
+        // answers a different question (content policy) and does not carry
+        // suffix info.
+        //
+        // Deliberately NOT awaited inline: the account-wide rate limit on
+        // Xbox's reserve endpoint (see probeGamertagReservation) means this
+        // can take anywhere from under a second to tens of seconds under
+        // load. Awaiting it here used to hold this worker's search slot
+        // hostage for that whole time — a burst of simultaneous hits could
+        // tie up every worker waiting its turn and freeze the entire search
+        // (state stuck "running", nothing moving). Recording a provisional
+        // "unknown" now and confirming in the background keeps the search
+        // itself always moving; only the specific hit's final classification
+        // is delayed.
+        const provisional = recordResult(gt, "unknown", policy, false);
+        const task: Promise<void> = (async () => {
+          const probeSignal = AbortSignal.any([abort.signal, AbortSignal.timeout(60_000)]);
+          let probeResult: Awaited<ReturnType<typeof probeGamertagReservation>>;
+          try {
+            probeResult = await probeGamertagReservation(gt, undefined, probeSignal);
+          } catch {
+            probeResult = { status: "error" };
+          }
+          if (session.state === "cancelled") return;
+          if (probeResult.status === "available") {
+            recordConfirmation(gt, policy);
+          } else {
+            // Not a hit after all — patch the already-recorded provisional
+            // entry in place so its reason is visible (e.g. "would only
+            // offer this gamertag with a suffix") instead of leaving it a
+            // bare unexplained "unknown". No new result/broadcast needed:
+            // the entry itself already represents this candidate.
+            provisional.policy = {
+              status: "unavailable",
+              message: probeResult.message ?? "Xbox would only offer this gamertag with a suffix attached.",
+            };
+          }
+        })().finally(() => { pendingProbes.delete(task); });
+        pendingProbes.add(task);
+      } else {
+        const alertable = status === "available" &&
+          (!session.runEthanPolicyCheck || policy?.status === "approved");
+        recordResult(gt, status, policy, alertable);
       }
-
-      pushActivity({
-        username: gt,
-        platform: "xbox",
-        format: session.label,
-        status: status === "available" ? "available" : status === "taken" ? "taken" : "unknown",
-        alertable,
-        policy: policy?.status,
-        sessionId: session.sessionId,
-      });
-
-      const cps = computeCps(session);
-      broadcastSSE(session, "result", { ...result, cps, attempts: session.attempts, found: session.found });
 
       // Pace to target CPS
       const elapsed   = Date.now() - checkStart;
@@ -414,6 +483,13 @@ async function runSearch(session: Session): Promise<void> {
       sleep(i * 10).then(() => worker()),
     ),
   );
+
+  // Every worker returning does not mean the search is actually done: a
+  // background suffix probe (pendingSuffixCheck above) can still be
+  // in flight. Wait for those to settle before declaring the session
+  // finished, or a legitimate confirmation could arrive after the SSE
+  // stream below is already closed and get silently lost.
+  await Promise.allSettled([...pendingProbes]);
 
   // An infinite search only leaves this runner when the user cancels it or
   // the process aborts. A finite source (a list or a fixed pattern) completes
@@ -554,6 +630,7 @@ router.post("/gamertag/search", async (req, res): Promise<void> => {
     abort,
     sseClients:    [],
     recentCheckTs: [],
+    seqCounter:    0,
   };
 
   sessions.set(sessionId, session);

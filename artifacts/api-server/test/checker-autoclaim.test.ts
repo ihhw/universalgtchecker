@@ -20,6 +20,21 @@ beforeEach(() => {
 
 const calls = (ep: string) => mock.state.log.filter((l) => l.endpoint === ep);
 const post = (p: string, body: unknown) => fetch(base + p, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+/**
+ * A suffix probe result now arrives asynchronously: a candidate that
+ * survives the primary check gets recorded immediately as a provisional
+ * "unknown", and — if the probe later confirms it — a SECOND, final result
+ * is pushed for the same gamertag. Tests need the last (highest seq) entry,
+ * not the first.
+ */
+function finalFor(snap: any, gamertag: string): any {
+  // `seq` isn't part of the API's zod response schema and gets stripped by
+  // GetGamertagSessionResponse.parse() server-side, so array order (results
+  // are always appended, never reordered) is what actually reflects which
+  // entry is most recent.
+  const matches = snap.results.filter((r: any) => r.gamertag === gamertag);
+  return matches.length > 0 ? matches[matches.length - 1] : null;
+}
 
 async function runList(names: string[], extra: Record<string, unknown>) {
   const res = await post("/gamertag/search", { config: { mode: "list", params: { names } }, rate: 5, ...extra });
@@ -86,7 +101,7 @@ test("Double Check 200 with no suffix and a matching name → still APPROVED (no
     sticky: { policy: { status: 200, body: { classicGamertag: "CleanTag", gamertag: "CleanTag", gamertagSuffix: "" } } },
   });
   const { snap } = await runList(["CleanTag"], { runEthanPolicyCheck: true });
-  const r = snap.results[0];
+  const r = finalFor(snap, "CleanTag");
   assert.equal(r.status, "available");
   assert.equal(r.policy.status, "approved");
   assert.equal(r.alertable, true);
@@ -119,7 +134,10 @@ test("Double Check OFF: the reserve probe still catches a suffix-only offer, usi
     },
   });
   const { snap } = await runList(["SufTag"], { autoClaim: false });
-  const r = snap.results[0];
+  // The probe found a suffix, so no confirmation ever arrives — the
+  // provisional "unknown" recorded immediately is the only (and final)
+  // entry for this gamertag.
+  const r = finalFor(snap, "SufTag");
   assert.equal(r.status, "unknown");
   assert.equal(r.policy.status, "unavailable");
   assert.match(r.policy.message, /SUFTAG#9401/);
@@ -128,7 +146,7 @@ test("Double Check OFF: the reserve probe still catches a suffix-only offer, usi
 
 test("Double Check OFF: the reserve probe confirms a genuinely free classic name → still APPROVED", async () => {
   const { snap } = await runList(["FreeOnly2"], { autoClaim: false });
-  const r = snap.results[0];
+  const r = finalFor(snap, "FreeOnly2");
   assert.equal(r.status, "available");
   assert.equal(r.alertable, true);
   assert.equal(calls("reserve").length, 1);
@@ -144,9 +162,13 @@ test("a burst of hits needing the probe all at once does not freeze the search",
   await control(mock.url, { latencyMs: { reserve: 300 } });
   const names = Array.from({ length: 20 }, (_, i) => `BurstTag${i}`);
   const { snap } = await runList(names, { rate: 20 });
-  assert.equal(snap.results.length, 20, "every hit got a result instead of the search stalling");
-  const skipped = snap.results.filter((r: any) => r.policy?.message?.includes("already queued"));
-  assert.ok(skipped.length > 0, "the queue-depth cap actually engaged under this burst");
+  const distinctTags = new Set(snap.results.map((r: any) => r.gamertag));
+  assert.equal(distinctTags.size, 20, "every hit got at least a provisional result instead of the search stalling");
+  // A hit whose probe got rejected by the queue-depth cap never gets a
+  // confirmation entry, so it stays at its provisional "unknown" — with a
+  // burst this size against an 8-deep cap, not all 20 should confirm.
+  const confirmed = names.filter((n) => finalFor(snap, n)?.status === "available");
+  assert.ok(confirmed.length < 20, `the queue-depth cap should have limited confirmations in this burst (got ${confirmed.length}/20)`);
 });
 
 test("POST /gamertag/claim: status codes and response shape (bot-compatible), no secrets", async () => {
