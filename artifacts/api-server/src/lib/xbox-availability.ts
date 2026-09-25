@@ -409,16 +409,32 @@ export async function checkViaCDN(
 export async function checkGamertag(gt: string, signal: AbortSignal): Promise<ResultStatus> {
   if (isBlockedByContentFilter(gt)) return "inappropriate";
 
-  try {
-    // CDN is reliable, fast, and has no rate-limit issues from Replit IPs.
-    const cdnResult = await checkViaCDN(gt, signal);
-    if (cdnResult !== null) return cdnResult;
-
-    return "error";
-  } catch (err: unknown) {
-    if (err instanceof Error && (err.name === "AbortError" || err.name === "TimeoutError")) {
-      throw err;
+  // The CDN check has no auth and no rate limit AT MODEST volume ("no
+  // rate-limit issues from Replit IPs" was true there), but at a high check
+  // rate from a single home IP it can and does get 429'd or dropped — with
+  // no retry, every one of those instantly became an unexplained "unknown"
+  // instead of a real answer, which is what a very high Rate setting was
+  // actually producing (thousands of "unknown" that were never really
+  // checked at all). One bounded retry turns a transient failure into a
+  // real result instead of silently giving up.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    let detail: CdnDetail;
+    try {
+      detail = await checkViaCDNDetailed(gt, signal, true);
+    } catch (err: unknown) {
+      if (err instanceof Error && (err.name === "AbortError" || err.name === "TimeoutError")) {
+        throw err;
+      }
+      if (attempt === 0) { await wait(250, signal); continue; }
+      return "error";
+    }
+    if (detail.status !== null) return detail.status;
+    if (attempt === 0) {
+      const backoffMs = detail.httpStatus === 429 ? Math.min(detail.retryAfterMs ?? 1_000, 3_000) : 250;
+      await wait(backoffMs, signal);
+      continue;
     }
     return "error";
   }
+  return "error";
 }
