@@ -71,20 +71,26 @@ const PROBE_SPACING_CAP_MS = 8_000;
 const PROBE_RELAX_AFTER_OK = 5;
 
 /**
- * Hard cap on how many probe calls may be queued for one account at once.
+ * Ceiling on how many probe calls may be queued for one account at once.
  *
- * Without this, a burst of simultaneous hits (bulk concurrent checking can
- * run up to 250 workers at once) all queue behind the SAME account's
- * single-file spacing chain — each one holding its worker's search slot the
- * entire time it waits its turn, which can stretch to minutes once spacing
- * backs off toward the 8s cap. Enough of those piling up starves every
- * other worker of a chance to start a new check, which looks exactly like
- * the checker freezing solid (state still "running", nothing moving).
- * Rejecting new probes past this depth instead of queueing them keeps a
- * burst degrading gracefully (those hits fall back to unprobed/unknown)
- * instead of stalling the whole search.
+ * This used to be a tight cap (8) to protect search workers that AWAITED
+ * the probe inline — a deep queue meant a worker could sit blocked for
+ * minutes, and enough of those piling up froze the whole search. That
+ * inline-await design is gone (see routes/gamertag.ts: a hit is recorded
+ * provisionally and confirmed in the background, never blocking the search
+ * loop), so a deep probe queue no longer blocks anything user-visible — it
+ * just means confirmations trickle in slower under heavy load. A low cap
+ * NOW only meant most hits gave up on ever being confirmed at all: with
+ * checking fast enough to produce hits quicker than one account can
+ * confirm them (every 350ms-8s), the queue stayed permanently full and
+ * nearly everything after the first few hits was rejected outright,
+ * forever stuck as an unexplained "unknown" even for names later confirmed
+ * by hand to be genuinely available.
+ *
+ * This is now just a safety valve against unbounded memory growth on a
+ * truly pathological run, not a normal-operation limit.
  */
-const PROBE_QUEUE_DEPTH_CAP = 8;
+const PROBE_QUEUE_DEPTH_CAP = 5_000;
 
 interface AccountProbeState {
   spacingMs: number;

@@ -152,23 +152,33 @@ test("Double Check OFF: the reserve probe confirms a genuinely free classic name
   assert.equal(calls("reserve").length, 1);
 });
 
-test("a burst of hits needing the probe all at once does not freeze the search", async () => {
+test("a burst of hits needing the probe all at once does not freeze the search, and all still get confirmed", async () => {
   // Regression test for a real freeze: a burst of simultaneous "available"
   // hits used to all queue single-file behind one account's probe spacing,
   // each holding its worker's search slot the whole time it waited its
   // turn -- enough of them piling up starved every worker and the search
-  // never finished. The probe's queue-depth cap should make excess probes
-  // in a burst fail fast (skipped, not alertable) instead of blocking.
-  await control(mock.url, { latencyMs: { reserve: 300 } });
+  // never finished. The probe is now decoupled from the search loop
+  // entirely (see routes/gamertag.ts), so a burst can no longer block
+  // anything, and the queue-depth cap is now a generous safety valve rather
+  // than a tight limit -- every hit in a burst this size should still get
+  // its confirmation eventually, just with each account's spacing paced out.
+  await control(mock.url, { latencyMs: { reserve: 50 } });
   const names = Array.from({ length: 20 }, (_, i) => `BurstTag${i}`);
-  const { snap } = await runList(names, { rate: 20 });
+  const res = await post("/gamertag/search", { config: { mode: "list", params: { names } }, rate: 20 });
+  assert.equal(res.status, 201);
+  const { sessionId } = (await res.json()) as { sessionId: string };
+  let snap: any;
+  // 20 items, each queued behind one account's 350ms spacing floor plus the
+  // scripted 50ms latency, can take a few seconds to fully drain -- a
+  // longer window than the other, single-hit tests need.
+  await until(async () => {
+    snap = await (await fetch(`${base}/gamertag/sessions/${sessionId}`)).json();
+    return snap.state === "completed";
+  }, 20_000);
   const distinctTags = new Set(snap.results.map((r: any) => r.gamertag));
   assert.equal(distinctTags.size, 20, "every hit got at least a provisional result instead of the search stalling");
-  // A hit whose probe got rejected by the queue-depth cap never gets a
-  // confirmation entry, so it stays at its provisional "unknown" — with a
-  // burst this size against an 8-deep cap, not all 20 should confirm.
   const confirmed = names.filter((n) => finalFor(snap, n)?.status === "available");
-  assert.ok(confirmed.length < 20, `the queue-depth cap should have limited confirmations in this burst (got ${confirmed.length}/20)`);
+  assert.equal(confirmed.length, 20, `every genuinely available hit in the burst should eventually confirm (got ${confirmed.length}/20)`);
 });
 
 test("POST /gamertag/claim: status codes and response shape (bot-compatible), no secrets", async () => {

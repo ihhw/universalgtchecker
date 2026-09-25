@@ -441,6 +441,14 @@ async function runSearch(session: Session): Promise<void> {
         // is delayed.
         const provisional = recordResult(gt, "unknown", policy, false);
         const task: Promise<void> = (async () => {
+          // Pause must actually stop Xbox traffic, not just new checks: wait
+          // here (before ever calling the probe, so this task doesn't even
+          // take a spot in the per-account queue) until resumed or the
+          // session ends.
+          while (session.paused && session.state === "running" && !abort.signal.aborted) {
+            await sleep(250);
+          }
+          if ((session.state as Session["state"]) !== "running" || abort.signal.aborted) return;
           const probeSignal = AbortSignal.any([abort.signal, AbortSignal.timeout(60_000)]);
           let probeResult: Awaited<ReturnType<typeof probeGamertagReservation>>;
           try {
