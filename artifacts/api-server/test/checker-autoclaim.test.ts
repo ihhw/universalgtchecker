@@ -19,6 +19,10 @@ beforeEach(() => {
 });
 
 const calls = (ep: string) => mock.state.log.filter((l) => l.endpoint === ep);
+// The reservation probe also calls the "change" endpoint, but only ever with
+// PreviewOnly: true (never applying a change) -- callers checking for a real
+// claim's change call should use this, not the raw endpoint filter.
+const realChanges = () => calls("change").filter((l) => (l.body as any)?.PreviewOnly !== true);
 const post = (p: string, body: unknown) => fetch(base + p, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
 
 async function runList(names: string[], extra: Record<string, unknown>) {
@@ -49,7 +53,7 @@ test("server-side auto-claim claims the FIRST confirmed hit only, with the brows
   });
   assert.ok(["HitAlpha", "HitBravo"].includes(final.claimed), `claimed=${final.claimed}`);
   assert.equal(final.autoClaim, false, "auto-claim switches off after the first confirmed claim");
-  assert.equal(calls("change").length, 1, "the account is renamed exactly once");
+  assert.equal(realChanges().length, 1, "the account is renamed exactly once");
   assert.equal(mock.state.gamertag, final.claimed);
 });
 
@@ -119,7 +123,12 @@ test("Double Check approves and the reserve probe confirms the exact name → st
   await control(mock.url, {
     sticky: {
       policy: { status: 200, body: {} },
+      // Scripting a sticky reserve response bypasses the mock's normal
+      // reservation bookkeeping, so the change-preview step also needs a
+      // scripted clean response here (a real reserve success would record
+      // the reservation the change endpoint checks for).
       reserve: { status: 200, body: { classicGamertag: "ProbeCleanTag", gamertag: "ProbeCleanTag", gamertagSuffix: "" } },
+      change: { status: 200, body: { Gamertag: "ProbeCleanTag", GamertagSuffix: "", hasFree: true } },
     },
   });
   const { snap } = await runList(["ProbeCleanTag"], { runEthanPolicyCheck: true });
@@ -151,6 +160,21 @@ test("Double Check OFF: the reserve probe still catches a suffix-only offer → 
   assert.match(r.policy.message, /#9001/);
   assert.equal(r.alertable, false);
   assert.equal(calls("policy").length, 0, "Double Check is off; only the reserve probe ran");
+});
+
+test("reserve looks clean but the change-preview reveals a suffix → UNKNOWN, not alertable", async () => {
+  // The reserve call alone can look clean (no suffix fields) while the real
+  // change step -- previewed here, never applied -- is where Xbox actually
+  // decides the exact classic name isn't grantable.
+  await control(mock.url, {
+    sticky: { change: { status: 200, body: { Gamertag: "PreviewTag", GamertagSuffix: "3344" } } },
+  });
+  const { snap } = await runList(["PreviewTag"], { autoClaim: false });
+  const r = snap.results[0];
+  assert.equal(r.status, "unknown");
+  assert.equal(r.policy.status, "unavailable");
+  assert.match(r.policy.message, /#3344/);
+  assert.equal(r.alertable, false);
 });
 
 test("Double Check OFF: the reserve probe confirms a clean exact-name offer → still APPROVED", async () => {

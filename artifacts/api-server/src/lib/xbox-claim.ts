@@ -293,18 +293,26 @@ async function send(
 
 // ─── Reservation probe ──────────────────────────────────────────────────────
 //
-// A non-destructive availability check that reuses the exact same reserve
-// call claimGamertag() makes as its own first step (never the change step,
-// so nothing is ever renamed) — because it's the only endpoint CONFIRMED by
-// real live testing to carry accurate information about whether Xbox will
-// grant the exact typed classic gamertag or only a suffixed one.
+// A non-destructive availability check: reserve the exact name (step 1 of
+// the real claim flow), then ask the real change endpoint to preview the
+// change (PreviewOnly: true) instead of applying it — never PreviewOnly:
+// false, so nothing is ever actually renamed.
 //
-// This exists because the separate Double Check policy endpoint
-// (user.mgt.xboxlive.com, in xbox-availability.ts) turned out NOT to
-// reliably signal this: a checker session found every one of its "Double
-// Check approved" hits actually required a suffix when an exact claim was
-// attempted. That endpoint answers a real but different question — content
-// policy acceptability — not gamertag-suffix allocation.
+// History, so this isn't re-litigated blind a fourth time: this probe
+// originally only did the reserve call and inspected ITS body for
+// gamertagSuffix/classicGamertag fields, on the assumption that reserve
+// carries suffix info. That assumption was never actually confirmed live —
+// only the reserve→change STRUCTURE was confirmed, not what reserve's body
+// says about suffixes — and real usage proved it wrong (hits kept coming
+// back suffixed at close to 100%). The separate Double Check policy
+// endpoint (user.mgt.xboxlive.com, in xbox-availability.ts) was ruled out
+// earlier for the same reason: it answers content-policy acceptability, not
+// suffix allocation.
+//
+// Every raw response body this probe sees is logged (truncated, no auth
+// headers) at debug level under "xbox_probe" so that if this STILL doesn't
+// catch a suffix case, the next report comes with real Xbox response data
+// to fix from instead of another guess.
 
 export type ReservationProbeStatus =
   | "available" | "taken" | "suffix_required" | "auth_required" | "rate_limited" | "error";
@@ -313,6 +321,22 @@ export interface ReservationProbeResult {
   status: ReservationProbeStatus;
   message?: string;
   httpStatus?: number;
+}
+
+/** True only when a response body affirmatively signals the exact classic name is free, with no suffix. */
+function suffixFromBody(body: string, gamertag: string): { suffixed: boolean; reserved?: string; suffix?: string } {
+  try {
+    const r = JSON.parse(body) as Record<string, unknown>;
+    const reserved = (r["classicGamertag"] ?? r["gamertag"] ?? r["Gamertag"] ?? r["modernGamertag"]) as string | undefined;
+    const suffix = (r["gamertagSuffix"] ?? r["GamertagSuffix"] ?? r["suffix"]) as string | undefined;
+    const hasFree = r["hasFree"];
+    if (typeof suffix === "string" && suffix.trim()) return { suffixed: true, reserved, suffix };
+    if (reserved && !sameTag(reserved, gamertag)) return { suffixed: true, reserved };
+    if (hasFree === false) return { suffixed: true };
+    return { suffixed: false, reserved };
+  } catch {
+    return { suffixed: false };
+  }
 }
 
 export async function probeGamertagReservation(
@@ -339,6 +363,7 @@ export async function probeGamertagReservation(
       reservationId: ctx.xuid,
       targetGamertagFields: "classicGamertag",
     }, RESERVE_TIMEOUT_MS);
+    logger.debug({ gamertag, endpoint: "reserve", status: reserve.status, body: snippet(reserve.text) }, "xbox_probe");
 
     const rs = reserve.status;
     if (rs === 429) {
@@ -357,17 +382,54 @@ export async function probeGamertagReservation(
       return { status: "error", httpStatus: rs, message: `Unexpected reservation probe response HTTP ${rs}.` };
     }
 
+    const reserveCheck = suffixFromBody(reserve.text, gamertag);
+    if (reserveCheck.suffixed) {
+      return {
+        status: "suffix_required",
+        httpStatus: rs,
+        message: `Xbox would only reserve "${reserveCheck.reserved ?? gamertag}${reserveCheck.suffix ? `#${reserveCheck.suffix}` : ""}", not the exact "${gamertag}".`,
+      };
+    }
+
+    // Reserve alone didn't flag a suffix. Ask the real change endpoint to
+    // PREVIEW the change (never applying it) — this is the step that
+    // actually performs the rename in a real claim, so it's the more
+    // credible source for whether the exact classic name would be granted.
+    let preview;
     try {
-      const r = JSON.parse(reserve.text) as { classicGamertag?: string; gamertag?: string; gamertagSuffix?: string };
-      const reserved = r.classicGamertag ?? r.gamertag;
-      if ((r.gamertagSuffix && r.gamertagSuffix.trim()) || (reserved && !sameTag(reserved, gamertag))) {
+      preview = await send(CHANGE_URL, ctx.authHeader, {
+        Gamertag: gamertag,
+        PreviewOnly: true,
+        ReservationId: ctx.xuid,
+      }, RESERVE_TIMEOUT_MS, { method: "POST", contractVersion: "3" });
+    } catch (err) {
+      // The preview call failing doesn't invalidate a clean reserve result;
+      // fall back to it rather than blocking every hit on this second call.
+      logger.debug({ gamertag, endpoint: "preview", err: err instanceof Error ? err.message : String(err) }, "xbox_probe");
+      return { status: "available", httpStatus: rs };
+    }
+    logger.debug({ gamertag, endpoint: "preview", status: preview.status, body: snippet(preview.text) }, "xbox_probe");
+
+    if (preview.status === 429) {
+      return { status: "rate_limited", httpStatus: preview.status, message: "Xbox rate-limited the reservation probe." };
+    }
+    if (preview.status === 409 || preview.status === 400) {
+      const desc = xboxDescription(preview.text);
+      return {
+        status: "suffix_required", httpStatus: preview.status,
+        message: desc ? `Xbox would not grant the exact "${gamertag}": ${desc}` : `Xbox would not grant the exact "${gamertag}" with no suffix.`,
+      };
+    }
+    if (preview.status === 200 || preview.status === 201 || preview.status === 204) {
+      const previewCheck = suffixFromBody(preview.text, gamertag);
+      if (previewCheck.suffixed) {
         return {
           status: "suffix_required",
-          httpStatus: rs,
-          message: `Xbox would only reserve "${reserved ?? gamertag}${r.gamertagSuffix ? `#${r.gamertagSuffix}` : ""}", not the exact "${gamertag}".`,
+          httpStatus: preview.status,
+          message: `Xbox would only grant "${previewCheck.reserved ?? gamertag}${previewCheck.suffix ? `#${previewCheck.suffix}` : ""}", not the exact "${gamertag}".`,
         };
       }
-    } catch { /* empty/non-JSON body: the status code is the confirmation */ }
+    }
     return { status: "available", httpStatus: rs };
   } catch (err) {
     const kind = errorKind(err);
