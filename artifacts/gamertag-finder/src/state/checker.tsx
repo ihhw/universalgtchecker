@@ -315,11 +315,15 @@ export function CheckerProvider({ children }: { children: ReactNode }) {
   }, [mode, params]);
 
   // ── Search settings ────────────────────────────────────────────────────────
+  // Not clamped to maxRate: that's an informational ceiling (past it,
+  // checks silently fail Xbox's own CDN rate limit more often without
+  // proxies spreading the load), not a hard restriction on what the user
+  // can choose to try.
   const setRate = useCallback((n: number) => {
-    const v = Math.min(maxRate, Math.max(1, Math.round(n) || 1));
+    const v = Math.min(1000, Math.max(1, Math.round(n) || 1));
     setRateState(v);
     writeStored(RATE_KEY, String(v));
-  }, [maxRate]);
+  }, []);
   const setDoubleCheck = useCallback((v: boolean) => { setDoubleCheckState(v); writeStored(DOUBLE_CHECK_KEY, String(v)); }, []);
   const setAutoClaim = useCallback((v: boolean) => { setAutoClaimState(v); writeStored(AUTOCLAIM_KEY, String(v)); }, []);
 

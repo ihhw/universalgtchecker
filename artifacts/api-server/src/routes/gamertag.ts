@@ -14,7 +14,7 @@ import { logger } from "../lib/logger";
 import { isBlockedByContentFilter } from "../lib/content-filter";
 import { getAuthHeader } from "../lib/xbox-auth";
 import {
-  checkGamertag, checkViaAvailabilityEndpoint, checkViaCDN, runEthanPolicyCheck, currentMaxRate, MAX_RATE_WITH_PROXY,
+  checkGamertag, checkViaAvailabilityEndpoint, checkViaCDN, runEthanPolicyCheck, currentMaxRate,
   type PolicyStatus, type ResultStatus,
 } from "../lib/xbox-availability";
 import { claimGamertag, listClaims, notifyClaimWebhook, probeGamertagReservation, type ClaimRecord } from "../lib/xbox-claim";
@@ -604,13 +604,14 @@ router.post("/gamertag/search", async (req, res): Promise<void> => {
   }
 
   const { config, rate, runEthanPolicyCheck, autoClaim } = parsed.data;
-  const maxRate = currentMaxRate();
-  if (!Number.isFinite(rate) || rate < 1 || rate > maxRate) {
-    res.status(400).json({
-      error: maxRate < 1_000
-        ? `Rate must be between 1 and ${maxRate} checks per second without proxies configured. Add Xbox proxies in Settings to raise this to ${MAX_RATE_WITH_PROXY}.`
-        : `Rate must be between 1 and ${maxRate} checks per second.`,
-    });
+  // Not enforced server-side: without proxies, a high rate just means more
+  // checks silently fail the CDN check's own rate limit and come back
+  // "unknown" (the retry in checkGamertag softens but doesn't eliminate
+  // this). That's a real tradeoff the user should be free to make, not a
+  // hard block — currentMaxRate() only drives the UI's rate-slider ceiling
+  // and hint text (see /xbox/settings/proxies), not what's accepted here.
+  if (!Number.isFinite(rate) || rate < 1 || rate > 1_000) {
+    res.status(400).json({ error: "Rate must be between 1 and 1000 checks per second." });
     return;
   }
 

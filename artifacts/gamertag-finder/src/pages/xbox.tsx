@@ -113,7 +113,7 @@ function ConfigStatus({ v }: { v: ConfigValidation }) {
 export default function XboxPage() {
   const c = useChecker();
   const s = c.snapshot;
-  const fill = ((c.rate - 1) / Math.max(1, c.maxRate - 1)) * 100;
+  const fill = ((c.rate - 1) / 999) * 100;
   const def = MODE_BY_ID[c.mode]!;
   const canStart = c.validation.status === "ok";
 
@@ -201,7 +201,7 @@ export default function XboxPage() {
               id="rate"
               type="range"
               min={1}
-              max={c.maxRate}
+              max={1000}
               step={1}
               value={c.rate}
               disabled={c.isRunning}
@@ -209,13 +209,14 @@ export default function XboxPage() {
               style={{ "--fill": `${fill}%` } as CSSProperties}
               className="range mt-2"
             />
-            {c.proxyCount === 0 && (
+            {c.proxyCount === 0 && c.rate > c.maxRate && (
               <p className="mt-2 text-[12px] leading-relaxed text-muted-foreground">
-                Capped at {c.maxRate}/s without proxies — Xbox's CDN rate-limits a single IP hard past this.{" "}
+                Above {c.maxRate}/s, Xbox's CDN rate-limits a single IP — expect more checks to come back
+                "unknown" instead of a real answer at this rate.{" "}
                 <Link href="/settings" className="font-medium text-primary underline underline-offset-2 hover:opacity-80">
                   Add proxies in Settings
                 </Link>{" "}
-                to raise this up to 1000/s.
+                to raise the reliable ceiling.
               </p>
             )}
 
