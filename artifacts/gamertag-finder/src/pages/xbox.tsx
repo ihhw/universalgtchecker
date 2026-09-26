@@ -223,8 +223,8 @@ export default function XboxPage() {
             <div className="mt-4 divide-y divide-border/60">
               <Option
                 id="double-check"
-                title="Double Check"
-                description="Adds an extra content-policy check before a hit is shown. Off by default: it doesn't know about suffixes (that's confirmed separately either way) and can reject names for reasons unrelated to availability."
+                title="Old verification method"
+                description="Uses Xbox's content-policy check alone and stops there — faster, but a hit can still turn out to need a suffix, since this method never confirms that. Off (default) uses the accurate method: every hit is confirmed with the real reservation check before it's ever shown as available."
                 checked={c.doubleCheck}
                 onChange={(v) => {
                   if (v && !c.isAuthed) { c.setConnectOpen(true); return; }

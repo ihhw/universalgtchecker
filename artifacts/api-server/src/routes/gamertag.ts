@@ -429,29 +429,32 @@ async function runSearch(session: Session): Promise<void> {
           if (reverify !== "available") {
             logCheckerDiagnostic({ gamertag: gt, primary: "available", reverify, outcome: reverify === "taken" ? "taken" : "unknown" });
             status = reverify === "taken" ? "taken" : "unknown";
+          } else if (session.runEthanPolicyCheck) {
+            // Legacy verification: the original method, kept only for
+            // comparison/rollback. It stops at Xbox's content-policy check
+            // (Double Check) and never confirms whether Xbox would actually
+            // hand over the exact name or only a suffixed one — so an
+            // "available" here can genuinely still need a suffix. The
+            // accurate method (default) below fixes exactly that by always
+            // confirming with the real reservation probe before alerting.
+            const policySignal = AbortSignal.any([
+              abort.signal,
+              AbortSignal.timeout(20_000),
+            ]);
+            const policyResult = await runEthanPolicyCheck(gt, policySignal, { fast: true });
+            policy = { status: policyResult.status, message: policyResult.message };
+            if (policyResult.status !== "approved") {
+              logCheckerDiagnostic({ gamertag: gt, primary: "available", reverify: "available", policy: policyResult.status, outcome: "unknown" });
+              status = "unknown";
+            } else {
+              logCheckerDiagnostic({ gamertag: gt, primary: "available", reverify: "available", policy: "approved", outcome: "available_legacy_unconfirmed_suffix" });
+            }
           } else {
-            if (session.runEthanPolicyCheck) {
-              // The policy endpoint may need its own 5-second 429 backoff, so it
-              // gets a fresh budget instead of inheriting the primary check's
-              // already-running 5-second timeout.
-              const policySignal = AbortSignal.any([
-                abort.signal,
-                AbortSignal.timeout(20_000),
-              ]);
-              const policyResult = await runEthanPolicyCheck(gt, policySignal, { fast: true });
-              policy = { status: policyResult.status, message: policyResult.message };
-              // An available result is only alertable after Ethan approves it.
-              // Auth, rate-limit, and network failures must not bypass the
-              // secondary check and accidentally send an unverified tag.
-              if (policyResult.status !== "approved") {
-                logCheckerDiagnostic({ gamertag: gt, primary: "available", reverify: "available", policy: policyResult.status, outcome: "unknown" });
-                status = "unknown";
-              }
-            }
-            if (status === "available") {
-              pendingSuffixCheck = true;
-              logCheckerDiagnostic({ gamertag: gt, primary: "available", reverify: "available", outcome: "pending_probe" });
-            }
+            // Accurate verification (default): confirm the exact no-suffix
+            // name with the real reservation probe before this can ever be
+            // shown as available. See probeGamertagReservation.
+            pendingSuffixCheck = true;
+            logCheckerDiagnostic({ gamertag: gt, primary: "available", reverify: "available", outcome: "pending_probe" });
           }
         }
       } catch {
