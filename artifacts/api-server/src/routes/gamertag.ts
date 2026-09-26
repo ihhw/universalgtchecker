@@ -52,6 +52,15 @@ interface Session {
   rate:          number;
   runEthanPolicyCheck: boolean;
   /**
+   * Reproduces the app's actual original (pre-fix) suffix-confirmation
+   * behavior verbatim, kept only so results can be compared against the
+   * current, accurate one: no retry on a network-error reverify, no retry
+   * on a 409 collision, and the original buggy suffix parser that reported
+   * "suffix required" on nearly every genuine hit. See parseReserveSuffix
+   * vs parseReserveSuffixLegacy in xbox-claim.ts for the actual bug.
+   */
+  legacyChecker: boolean;
+  /**
    * Server-side auto-claim. Claims only alertable hits, one at a time, and
    * switches itself off after the first Xbox-confirmed claim so the account
    * is never renamed twice by one search.
@@ -416,8 +425,12 @@ async function runSearch(session: Session): Promise<void> {
           // connection hiccup (seen in bursts under load, where several
           // concurrent reverify requests time out together). Retry a
           // couple of times before accepting defeat.
+          // "Old checker" mode intentionally skips the retry (single
+          // attempt, matching the app's actual original behavior) so a
+          // reverify network hiccup gets written off as taken/unknown --
+          // reproduced verbatim for comparison, not something to copy.
           let reverify: ResultStatus = "error";
-          for (let attempt = 0; attempt < 3; attempt++) {
+          for (let attempt = 0; attempt < (session.legacyChecker ? 1 : 3); attempt++) {
             const reverifySignal = AbortSignal.any([abort.signal, AbortSignal.timeout(5_000)]);
             try {
               reverify = await checkGamertag(gt, reverifySignal);
@@ -429,32 +442,29 @@ async function runSearch(session: Session): Promise<void> {
           if (reverify !== "available") {
             logCheckerDiagnostic({ gamertag: gt, primary: "available", reverify, outcome: reverify === "taken" ? "taken" : "unknown" });
             status = reverify === "taken" ? "taken" : "unknown";
-          } else if (session.runEthanPolicyCheck) {
-            // Legacy verification: the original method, kept only for
-            // comparison/rollback. It stops at Xbox's content-policy check
-            // (Double Check) and never confirms whether Xbox would actually
-            // hand over the exact name or only a suffixed one — so an
-            // "available" here can genuinely still need a suffix. The
-            // accurate method (default) below fixes exactly that by always
-            // confirming with the real reservation probe before alerting.
-            const policySignal = AbortSignal.any([
-              abort.signal,
-              AbortSignal.timeout(20_000),
-            ]);
-            const policyResult = await runEthanPolicyCheck(gt, policySignal, { fast: true });
-            policy = { status: policyResult.status, message: policyResult.message };
-            if (policyResult.status !== "approved") {
-              logCheckerDiagnostic({ gamertag: gt, primary: "available", reverify: "available", policy: policyResult.status, outcome: "unknown" });
-              status = "unknown";
-            } else {
-              logCheckerDiagnostic({ gamertag: gt, primary: "available", reverify: "available", policy: "approved", outcome: "available_legacy_unconfirmed_suffix" });
-            }
           } else {
-            // Accurate verification (default): confirm the exact no-suffix
-            // name with the real reservation probe before this can ever be
-            // shown as available. See probeGamertagReservation.
-            pendingSuffixCheck = true;
-            logCheckerDiagnostic({ gamertag: gt, primary: "available", reverify: "available", outcome: "pending_probe" });
+            if (session.runEthanPolicyCheck) {
+              // The policy endpoint may need its own 5-second 429 backoff, so it
+              // gets a fresh budget instead of inheriting the primary check's
+              // already-running 5-second timeout.
+              const policySignal = AbortSignal.any([
+                abort.signal,
+                AbortSignal.timeout(20_000),
+              ]);
+              const policyResult = await runEthanPolicyCheck(gt, policySignal, { fast: true });
+              policy = { status: policyResult.status, message: policyResult.message };
+              // An available result is only alertable after Ethan approves it.
+              // Auth, rate-limit, and network failures must not bypass the
+              // secondary check and accidentally send an unverified tag.
+              if (policyResult.status !== "approved") {
+                logCheckerDiagnostic({ gamertag: gt, primary: "available", reverify: "available", policy: policyResult.status, outcome: "unknown" });
+                status = "unknown";
+              }
+            }
+            if (status === "available") {
+              pendingSuffixCheck = true;
+              logCheckerDiagnostic({ gamertag: gt, primary: "available", reverify: "available", outcome: "pending_probe" });
+            }
           }
         }
       } catch {
@@ -508,7 +518,7 @@ async function runSearch(session: Session): Promise<void> {
             if ((session.state as Session["state"]) !== "running" || abort.signal.aborted) return;
             const probeSignal = AbortSignal.any([abort.signal, AbortSignal.timeout(60_000)]);
             try {
-              probeResult = await probeGamertagReservation(gt, undefined, probeSignal);
+              probeResult = await probeGamertagReservation(gt, undefined, probeSignal, { legacy: session.legacyChecker });
             } catch {
               probeResult = { status: "error" };
             }
@@ -670,7 +680,7 @@ router.post("/gamertag/search", async (req, res): Promise<void> => {
     res.status(400).json({ error: parsed.error.message }); return;
   }
 
-  const { config, rate, runEthanPolicyCheck, autoClaim } = parsed.data;
+  const { config, rate, runEthanPolicyCheck, legacyChecker, autoClaim } = parsed.data;
   // Not enforced server-side: without proxies, a high rate just means more
   // checks silently fail the CDN check's own rate limit and come back
   // "unknown" (the retry in checkGamertag softens but doesn't eliminate
@@ -700,6 +710,7 @@ router.post("/gamertag/search", async (req, res): Promise<void> => {
     exhausted:     false,
     rate:          Math.round(rate),
     runEthanPolicyCheck: runEthanPolicyCheck ?? false,
+    legacyChecker: legacyChecker ?? false,
     autoClaim:     autoClaim ?? false,
     claimed:       null,
     state:         "running",
@@ -716,7 +727,7 @@ router.post("/gamertag/search", async (req, res): Promise<void> => {
   };
 
   sessions.set(sessionId, session);
-  req.log.info({ sessionId, mode: config.mode, rate, runEthanPolicyCheck, autoClaim }, "Starting gamertag search");
+  req.log.info({ sessionId, mode: config.mode, rate, runEthanPolicyCheck, legacyChecker, autoClaim }, "Starting gamertag search");
 
   runSearch(session).catch((err) => logger.error({ err, sessionId }, "Search error"));
 

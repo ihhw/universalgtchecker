@@ -546,6 +546,44 @@ export function parseReserveSuffix(body: string, gamertag: string): ReserveSuffi
   }
 }
 
+/**
+ * The ORIGINAL (pre-fix) suffix parser, kept byte-for-byte as it shipped
+ * before the fix above, exclusively so the Checker's "Old checker" option
+ * can reproduce the app's actual original, known-buggy behavior for
+ * comparison rather than an approximation of it.
+ *
+ * The bug: `suffixed: true` was hardcoded on this branch regardless of
+ * whether `modernGamertagSuffix` actually held anything, because
+ * `uniqueModernGamertag`/`modernGamertagSuffix` are populated on nearly
+ * every response (suffixed or not) — so this treated essentially every
+ * genuine no-suffix hit as suffix-required. That's what "0 available"
+ * across hundreds of real checks traced back to; see parseReserveSuffix
+ * above for the fix and the full explanation.
+ */
+export function parseReserveSuffixLegacy(body: string, gamertag: string): ReserveSuffixInfo {
+  try {
+    const r = JSON.parse(body) as {
+      promptForClassicGamertag?: boolean;
+      modernGamertagSuffix?: string;
+      modernGamertag?: string;
+      uniqueModernGamertag?: string;
+      gamertag?: string;
+      classicGamertag?: string;
+    };
+    if (r.promptForClassicGamertag === true) {
+      return { suffixed: false, offered: r.classicGamertag ?? gamertag };
+    }
+    const suffix = (r.modernGamertagSuffix ?? "").trim();
+    return {
+      suffixed: true,
+      offered: r.uniqueModernGamertag ?? r.gamertag ?? (r.modernGamertag && suffix ? `${r.modernGamertag}#${suffix}` : undefined),
+      suffix: suffix || undefined,
+    };
+  } catch {
+    return { suffixed: false };
+  }
+}
+
 function errorKind(err: unknown): "timeout" | "network" {
   const name = err instanceof Error ? err.name : "";
   return name === "TimeoutError" || name === "AbortError" ? "timeout" : "network";
@@ -598,7 +636,9 @@ export async function probeGamertagReservation(
   gamertag: string,
   accountId?: AccountSelection,
   signal?: AbortSignal,
+  opts?: { legacy?: boolean },
 ): Promise<ReservationProbeResult> {
+  const legacy = opts?.legacy === true;
   let id: string;
   if (accountId && accountId !== "automatic") {
     // An explicit pin still goes through the normal single-account
@@ -704,7 +744,11 @@ export async function probeGamertagReservation(
         // before accepting it as a real conflict.
         let code: number | undefined;
         try { code = (JSON.parse(reserve.text) as { code?: number }).code; } catch { /* not JSON */ }
-        if (code === 1024 && attempt === 0) {
+        // The old checker treated every 409 as a real "taken" verdict with
+        // no retry, which is what made a mid-collision 409 permanently
+        // write off genuine hits (e.g. HQ0H). Reproduced here verbatim for
+        // "Old checker" mode; see above for the fix.
+        if (!legacy && code === 1024 && attempt === 0) {
           await wait(500, signal);
           continue;
         }
@@ -731,7 +775,7 @@ export async function probeGamertagReservation(
         return { status: "error", httpStatus: rs, message: `Unexpected reservation probe response HTTP ${rs}.` };
       }
 
-      const check = parseReserveSuffix(reserve.text, gamertag);
+      const check = legacy ? parseReserveSuffixLegacy(reserve.text, gamertag) : parseReserveSuffix(reserve.text, gamertag);
       // Verdict appended to the same log entry already written above.
       logProbeDiagnostic({ gamertag, accountId: id, httpStatus: rs, verdict: check, followUp: true });
       if (check.suffixed) {

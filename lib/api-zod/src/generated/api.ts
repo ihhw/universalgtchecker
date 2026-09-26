@@ -32,6 +32,7 @@ export const StartGamertagSearchBody = zod.object({
 }),
   "rate": zod.number().min(1).max(startGamertagSearchBodyRateMax).describe('Checks per second'),
   "runEthanPolicyCheck": zod.boolean().optional().describe('When true, run the Xbox reserve policy check (Double Check) on tags that pass the primary lookup'),
+  "legacyChecker": zod.boolean().optional().describe('When true, reproduces the app\'s original (pre-fix) suffix-confirmation behavior verbatim for comparison: no retry on a network-error reverify, no retry on a 409 collision, and the original suffix parser. Off by default (accurate).'),
   "autoClaim": zod.boolean().optional().describe('When true, the server claims the first confirmed hit (available, and Double Check approved when enabled) for the connected Xbox account')
 })
 

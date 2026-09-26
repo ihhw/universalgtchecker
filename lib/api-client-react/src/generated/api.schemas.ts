@@ -62,6 +62,8 @@ export interface GamertagSearchInput {
   rate: number;
   /** When true, run the Xbox reserve policy check (Double Check) on tags that pass the primary lookup */
   runEthanPolicyCheck?: boolean;
+  /** When true, reproduces the app's original (pre-fix) suffix-confirmation behavior verbatim for comparison: no retry on a network-error reverify, no retry on a 409 collision, and the original suffix parser. Off by default (accurate). */
+  legacyChecker?: boolean;
   /** When true, the server claims the first confirmed hit (available, and Double Check approved when enabled) for the connected Xbox account */
   autoClaim?: boolean;
 }

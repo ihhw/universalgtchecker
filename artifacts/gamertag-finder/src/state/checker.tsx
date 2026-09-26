@@ -50,6 +50,7 @@ export interface ConfigValidation {
 const SESSION_KEY = "universal-xbox-session";
 const SAVED_KEY = "gtag-saved";
 const DOUBLE_CHECK_KEY = "gtag-ethan-policy";
+const LEGACY_CHECKER_KEY = "gtag-legacy-checker";
 const AUTOCLAIM_KEY = "gtag-autoclaim";
 const RATE_KEY = "universal-xbox-rate";
 /** Ceiling with no proxies configured; the server raises this once proxies are set. */
@@ -81,6 +82,9 @@ interface CheckerContextValue {
   refreshProxyState: () => Promise<void>;
   doubleCheck: boolean;
   setDoubleCheck: (v: boolean) => void;
+  /** Reproduces the app's original (pre-fix), known-inaccurate checker for comparison. Off by default. */
+  legacyChecker: boolean;
+  setLegacyChecker: (v: boolean) => void;
   autoClaim: boolean;
   setAutoClaim: (v: boolean) => void;
   // session
@@ -195,6 +199,7 @@ export function CheckerProvider({ children }: { children: ReactNode }) {
     return Number.isFinite(n) && n >= 1 && n <= 1000 ? Math.round(n) : 8;
   });
   const [doubleCheck, setDoubleCheckState] = useState(() => readStored(DOUBLE_CHECK_KEY) === "true");
+  const [legacyChecker, setLegacyCheckerState] = useState(() => readStored(LEGACY_CHECKER_KEY) === "true");
   const [autoClaim, setAutoClaimState] = useState(() => readStored(AUTOCLAIM_KEY) === "true");
 
   const [sessionId, setSessionId] = useState<string | null>(() => {
@@ -325,6 +330,7 @@ export function CheckerProvider({ children }: { children: ReactNode }) {
     writeStored(RATE_KEY, String(v));
   }, []);
   const setDoubleCheck = useCallback((v: boolean) => { setDoubleCheckState(v); writeStored(DOUBLE_CHECK_KEY, String(v)); }, []);
+  const setLegacyChecker = useCallback((v: boolean) => { setLegacyCheckerState(v); writeStored(LEGACY_CHECKER_KEY, String(v)); }, []);
   const setAutoClaim = useCallback((v: boolean) => { setAutoClaimState(v); writeStored(AUTOCLAIM_KEY, String(v)); }, []);
 
   // ── Session controls ───────────────────────────────────────────────────────
@@ -355,6 +361,7 @@ export function CheckerProvider({ children }: { children: ReactNode }) {
         config: { mode: mode as GenerationMode, params },
         rate,
         runEthanPolicyCheck: doubleCheck,
+        legacyChecker,
         // Auto-claim runs on the server, so it keeps working with this tab closed.
         autoClaim,
       };
@@ -377,7 +384,7 @@ export function CheckerProvider({ children }: { children: ReactNode }) {
       startingRef.current = false;
       setStarting(false);
     }
-  }, [isRunning, validation, doubleCheck, isAuthed, autoClaim, accountReady, auth.status?.account?.reason, mode, params, rate, persistSession]);
+  }, [isRunning, validation, doubleCheck, legacyChecker, isAuthed, autoClaim, accountReady, auth.status?.account?.reason, mode, params, rate, persistSession]);
 
   const stop = useCallback(async () => {
     if (!sessionId) return;
@@ -516,14 +523,14 @@ export function CheckerProvider({ children }: { children: ReactNode }) {
     mode, setMode, params, setParams, validation,
     builtinTemplates: BUILTIN_TEMPLATES, savedTemplates, applyTemplate, saveTemplate, deleteTemplate,
     templateSourceLabel: MODE_BY_ID[lastRealMode]?.label ?? "",
-    rate, setRate, maxRate, proxyCount, refreshProxyState, doubleCheck, setDoubleCheck, autoClaim, setAutoClaim,
+    rate, setRate, maxRate, proxyCount, refreshProxyState, doubleCheck, setDoubleCheck, legacyChecker, setLegacyChecker, autoClaim, setAutoClaim,
     sessionId, snapshot, isRunning, isPaused, starting, start, stop, togglePause, reset,
     feed, feedConnected, clearFeed, hits,
     saved, save, unsave, exportSaved, claimStatuses, claimRecords, claim,
     auth, isAuthed, accountReady, connectOpen, setConnectOpen,
   }), [
     mode, setMode, params, setParams, validation, savedTemplates, applyTemplate, saveTemplate, deleteTemplate, lastRealMode,
-    rate, setRate, maxRate, proxyCount, refreshProxyState, doubleCheck, setDoubleCheck, autoClaim, setAutoClaim,
+    rate, setRate, maxRate, proxyCount, refreshProxyState, doubleCheck, setDoubleCheck, legacyChecker, setLegacyChecker, autoClaim, setAutoClaim,
     sessionId, snapshot, isRunning, isPaused, starting, start, stop, togglePause, reset,
     feed, feedConnected, clearFeed, hits, saved, save, unsave, exportSaved, claimStatuses, claimRecords, claim,
     auth, isAuthed, accountReady, connectOpen,
