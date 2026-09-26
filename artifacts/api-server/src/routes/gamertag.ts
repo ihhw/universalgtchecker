@@ -470,16 +470,38 @@ async function runSearch(session: Session): Promise<void> {
             await sleep(250);
           }
           if ((session.state as Session["state"]) !== "running" || abort.signal.aborted) return;
-          const probeSignal = AbortSignal.any([abort.signal, AbortSignal.timeout(60_000)]);
-          let probeResult: Awaited<ReturnType<typeof probeGamertagReservation>>;
-          try {
-            probeResult = await probeGamertagReservation(gt, undefined, probeSignal);
-          } catch {
-            probeResult = { status: "error" };
+
+          // "rate_limited"/"error" mean the probe never actually reached
+          // Xbox with a real answer — every account was busy/suspended, or
+          // the request itself failed. Treating that the same as a genuine
+          // Xbox "no" was silently mislabeling unconfirmed candidates as
+          // unavailable forever, which under a fast search with several
+          // accounts cycling through rate limits meant almost nothing ever
+          // got confirmed as available even when it genuinely was. Retry
+          // those with backoff instead of giving up after one attempt.
+          const RETRY_DELAYS_MS = [2_000, 5_000, 15_000, 30_000, 60_000];
+          let probeResult: Awaited<ReturnType<typeof probeGamertagReservation>> = { status: "error" };
+          for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt++) {
+            if ((session.state as Session["state"]) !== "running" || abort.signal.aborted) return;
+            const probeSignal = AbortSignal.any([abort.signal, AbortSignal.timeout(60_000)]);
+            try {
+              probeResult = await probeGamertagReservation(gt, undefined, probeSignal);
+            } catch {
+              probeResult = { status: "error" };
+            }
+            if (probeResult.status !== "rate_limited" && probeResult.status !== "error") break;
+            if (attempt < RETRY_DELAYS_MS.length) await sleep(RETRY_DELAYS_MS[attempt]!);
           }
           if (session.state === "cancelled") return;
           if (probeResult.status === "available") {
             recordConfirmation(gt, policy);
+          } else if (probeResult.status === "rate_limited" || probeResult.status === "error") {
+            // Retries exhausted with no real Xbox answer — say so plainly
+            // rather than falsely reporting it as taken/unavailable.
+            provisional.policy = {
+              status: "unavailable",
+              message: "Could not confirm with Xbox after repeated attempts (rate-limited/network). Not necessarily taken.",
+            };
           } else {
             // Not a hit after all — patch the already-recorded provisional
             // entry in place so its reason is visible (e.g. "would only
