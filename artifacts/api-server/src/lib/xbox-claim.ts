@@ -512,7 +512,7 @@ export function parseReserveSuffix(body: string, gamertag: string): ReserveSuffi
     }
     const suffix = (r.modernGamertagSuffix ?? "").trim();
     return {
-      suffixed: true,
+      suffixed: suffix.length > 0,
       offered: r.uniqueModernGamertag ?? r.gamertag ?? (r.modernGamertag && suffix ? `${r.modernGamertag}#${suffix}` : undefined),
       suffix: suffix || undefined,
     };
