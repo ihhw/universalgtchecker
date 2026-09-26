@@ -84,13 +84,13 @@ test("TAKEN → AVAILABLE (Double Check approved) → CLAIMING → CLAIMED; webh
     assert.equal(typeof s.latency[k], "number", `${k} measured`);
   }
   const m = msgs();
-  const iAvail = m.findIndex((x) => /TargetTag — AVAILABLE \(CDN HTTP 404 · Double Check approved/.test(x));
+  const iAvail = m.findIndex((x) => /TargetTag — AVAILABLE \(CDN HTTP 404 · reserve probe confirms no suffix needed/.test(x));
   const iSent = m.indexOf("Claim request sent for TargetTag");
   const iOk = m.findIndex((x) => x.startsWith("Claim confirmed by Xbox"));
   assert.ok(iAvail >= 0 && iSent > iAvail && iOk > iSent, m.join("\n"));
-  // Double Check ran before the claim; claim = reserve then change.
-  const order = mock.state.log.map((l) => l.endpoint).filter((e) => ["policy", "reserve", "change"].includes(e));
-  assert.deepEqual(order, ["policy", "reserve", "change"]);
+  // Double Check's reserve probe ran before the claim; claim = reserve then change.
+  const order = mock.state.log.map((l) => l.endpoint).filter((e) => ["reserve", "change"].includes(e));
+  assert.deepEqual(order, ["reserve", "reserve", "change"]);
   await until(() => webhooks.length === 1, 2_000);
   const f = webhooks[0]!.body.embeds[0].fields;
   assert.equal(f[1].value, "CLAIMED");
@@ -102,18 +102,24 @@ test("TAKEN → AVAILABLE (Double Check approved) → CLAIMING → CLAIMED; webh
 
 test("Double Check says taken (409) → not available, no claim (Double Check preserved)", async () => {
   mock.state.taken.delete("TARGETTAG");
-  await control(mock.url, { sticky: { policy: { status: 409, body: {} } } });
+  await control(mock.url, { sticky: { reserve: { status: 409, body: {} } } });
   await start({ target: "TargetTag", intervalMs: 500 });
   await until(() => snap().checks >= 2, 5_000);
   stop();
   assert.equal(snap().availability, "taken");
-  assert.equal(calls("reserve").length, 0);
-  assert.ok(msgs().some((m) => /Double Check says taken \(HTTP 409\)/.test(m)));
+  assert.equal(calls("change").length, 0);
+  assert.ok(msgs().some((m) => /reserve probe says taken \(HTTP 409\)/.test(m)));
 });
 
 test("claim fails (taken by someone else) → CLAIM FAILED, keeps watching with a claim cooldown", async () => {
   mock.state.taken.delete("TARGETTAG");
-  await control(mock.url, { sticky: { reserve: { status: 409, body: { description: "Gamertag is not available" } } } });
+  // First reserve call is Double Check's own probe (must see it as available
+  // so the sniper proceeds to claim); the claim's own reserve step then
+  // hits the race — someone else grabbed it in between.
+  await control(mock.url, { queues: { reserve: [
+    { status: 200, body: { promptForClassicGamertag: true, classicTranslationLevel: "Full", modernGamertag: "TargetTag", uniqueModernGamertag: "TargetTag", modernGamertagSuffix: "0001", classicGamertag: "TargetTag", gamertag: "TargetTag" } },
+    { status: 409, body: { description: "Gamertag is not available" } },
+  ] } });
   await start({ target: "TargetTag", intervalMs: 500, notifications: true });
   store.saveWebhook({ url: WEBHOOK_URL, enabled: true });
   await until(() => snap().claim === "claim_failed", 5_000);
@@ -150,7 +156,10 @@ test("network failure on a check → NETWORK ERROR logged, sniper keeps watching
 test("claim auth error → sniper stops with the real reason", async () => {
   mock.state.taken.delete("TARGETTAG");
   await control(mock.url, { sticky: { reserve: { status: 403, body: { description: "Account restricted" } } } });
-  await start({ target: "TargetTag", intervalMs: 500 });
+  // Double Check off: this exercises the claim's own reserve auth failure,
+  // not Double Check's probe (which would hit the same 403 first and stop
+  // the sniper with a different, probe-specific message).
+  await start({ target: "TargetTag", intervalMs: 500, doubleCheck: false });
   await until(() => snap().state === "error", 5_000);
   assert.equal(snap().claim, "auth_error");
   assert.match(snap().stopReason ?? "", /Account restricted/);
@@ -162,7 +171,9 @@ test("Auto Claim OFF → reports AVAILABLE but never claims", async () => {
   await until(() => snap().availability === "available", 5_000);
   await until(() => snap().checks >= 2, 5_000);
   assert.equal(snap().claim, "disabled");
-  assert.equal(calls("reserve").length, 0);
+  // Double Check's own reserve probe still runs (it's how "available" gets
+  // confirmed), but the claim engine's change step never fires.
+  assert.equal(calls("change").length, 0);
   stop();
 });
 

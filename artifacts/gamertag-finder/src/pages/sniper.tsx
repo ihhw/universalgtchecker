@@ -494,7 +494,7 @@ export default function SniperPage() {
             <Toggle
               id="sniper-doublecheck"
               title="Double Check"
-              description="Confirm availability with Xbox's policy check before claiming (same as the Checker)."
+              description="Confirm the exact name needs no suffix before claiming, using the same reservation probe as the Checker."
               checked={draft.doubleCheck}
               onChange={(v) => setField("doubleCheck", v)}
             />

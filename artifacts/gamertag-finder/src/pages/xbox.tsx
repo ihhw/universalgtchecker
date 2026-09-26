@@ -224,7 +224,7 @@ export default function XboxPage() {
               <Option
                 id="double-check"
                 title="Double Check"
-                description="Verifies Xbox gamertag availability through an additional policy check before a username can be confirmed as available."
+                description="Adds an extra content-policy check before a hit is shown. Off by default: it doesn't know about suffixes (that's confirmed separately either way) and can reject names for reasons unrelated to availability."
                 checked={c.doubleCheck}
                 onChange={(v) => {
                   if (v && !c.isAuthed) { c.setConnectOpen(true); return; }

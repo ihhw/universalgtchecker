@@ -9,10 +9,11 @@
  * server restart resumes watching. SSE is only a realtime push of the same
  * snapshots the polling endpoint returns.
  *
- * Availability uses exactly the Checker's mechanism (xbox-availability.ts):
- * CDN primary check, then — with Double Check on — the Xbox reserve policy
- * check, which must return `approved`. Claims go through the shared claim
- * engine, which only reports CLAIMED when Xbox confirms it.
+ * Availability uses the same mechanism as the Checker: a CDN primary check,
+ * then — with Double Check on — the same suffix-confirming reservation
+ * probe used for bulk hits (xbox-claim.ts), which must come back with no
+ * suffix required. Claims go through the shared claim engine, which only
+ * reports CLAIMED when Xbox confirms it.
  *
  * Every activity entry is produced by a real backend step; nothing is
  * simulated.
@@ -24,9 +25,9 @@ import crypto from "crypto";
 import { logger } from "./logger";
 import { isBlockedByContentFilter } from "./content-filter";
 import { validateXboxGamertag } from "./xbox-validation";
-import { checkViaCDNDetailed, runEthanPolicyCheck, wait } from "./xbox-availability";
+import { checkViaCDNDetailed, wait } from "./xbox-availability";
 import {
-  claimGamertag, claimStateLabel, notifyClaimWebhook, warmClaimConnection,
+  claimGamertag, claimStateLabel, notifyClaimWebhook, probeGamertagReservation, warmClaimConnection,
   type ClaimRecord, type ClaimState,
 } from "./xbox-claim";
 import { getActiveAccountStatus, verifyActiveAccount, type ActiveAccountStatus } from "./xbox-auth";
@@ -278,25 +279,32 @@ async function checkAvailability(run: TargetRun, target: string, signal: AbortSi
   if (!run.snap.config.doubleCheck) {
     return { availability: "available", detail: `CDN HTTP ${cdn.httpStatus} (primary check only — Double Check off)` };
   }
-  const policy = await runEthanPolicyCheck(
+  // Double Check now uses the same suffix-confirming reserve probe as the
+  // bulk Checker (gamertag.xboxlive.com/gamertags/reserve), not Xbox's
+  // separate content-policy endpoint (user.mgt.xboxlive.com). That policy
+  // endpoint answers "is this name allowed", not "is a classic (no-suffix)
+  // slot free" — it carries no suffix information at all, so a name it
+  // approved could still only be claimable with a random suffix attached,
+  // and a name it rejected could be a transient/stricter false negative.
+  // The reserve probe is the actual signal the claim itself depends on.
+  const probe = await probeGamertagReservation(
     target,
+    run.snap.config.accountId,
     AbortSignal.any([signal, AbortSignal.timeout(10_000)]),
-    { retryOn429: false, fast: true },
   );
-  switch (policy.status) {
-    case "approved":
-      return { availability: "available", detail: `CDN HTTP ${cdn.httpStatus} · Double Check approved (HTTP ${policy.httpStatus})` };
-    case "unavailable":
-      return { availability: "taken", detail: `CDN said free, Double Check says taken (HTTP ${policy.httpStatus})` };
-    case "banned":
-      return { availability: "invalid", detail: `Double Check: Xbox marked the gamertag unacceptable (HTTP ${policy.httpStatus})` };
+  switch (probe.status) {
+    case "available":
+      return { availability: "available", detail: `CDN HTTP ${cdn.httpStatus} · reserve probe confirms no suffix needed` };
+    case "taken":
+      return { availability: "taken", detail: `CDN said free, reserve probe says taken (HTTP ${probe.httpStatus ?? "?"})` };
+    case "suffix_required":
+      return { availability: "taken", detail: probe.message ?? "Xbox would only offer this gamertag with a suffix attached." };
     case "rate_limited":
-      return { availability: "rate_limited", detail: "Double Check returned HTTP 429", backoffMs: bumpRateBackoff(run, policy.retryAfterMs) };
+      return { availability: "rate_limited", detail: "Reserve probe was rate-limited", backoffMs: bumpRateBackoff(run, undefined) };
     case "auth_required":
-    case "not_configured":
-      return { availability: "auth_error", detail: `Double Check: ${policy.message ?? "authorization required"}` };
+      return { availability: "auth_error", detail: `Reserve probe: ${probe.message ?? "authorization required"}` };
     default:
-      return { availability: "unknown", detail: `Double Check: ${policy.message ?? "error"}` };
+      return { availability: "unknown", detail: `Reserve probe: ${probe.message ?? "error"}` };
   }
 }
 
