@@ -88,6 +88,10 @@ sniper.json
 artifacts/api-server/stats.json
 stats.json
 
+# Persistent "recently confirmed taken" cache (runtime)
+artifacts/api-server/checked-cache.json
+checked-cache.json
+
 # Python
 __pycache__/
 *.pyc

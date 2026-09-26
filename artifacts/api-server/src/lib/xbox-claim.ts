@@ -282,21 +282,46 @@ export function claimInProgress(accountId: string): string | null { return busy.
  * connected, instead of queuing everything behind one.
  */
 let probeAccountCursor = 0;
+
+/**
+ * How soon (ms from now, floored at 0) an account's own adaptive spacing
+ * would let it take the next probe. Accounts that just got 429'd back off to
+ * a much longer spacingMs than one that's been answering cleanly (see
+ * PROBE_SPACING_ consts and raiseProbeSpacing above) — plain round-robin still gave a
+ * backed-off account its turn in the cycle just as often as a fast one,
+ * which meant a probe could land in a long queue behind a slow account
+ * while a fast one sat idle. Routing to whichever eligible account is
+ * projected ready soonest fixes that without changing each account's own
+ * pacing/backoff logic at all.
+ */
+function readyInMs(accountId: string): number {
+  const state = probeStateByAccount.get(accountId);
+  if (!state) return 0; // never probed yet — ready now
+  return Math.max(0, state.lastRequestAt + state.spacingMs - Date.now());
+}
+
 function pickProbeAccount(): string | null {
   const all = getAccountInfoList().filter((a) => !isAccountRateLimited(a.id));
   if (all.length === 0) return null;
-  for (let i = 0; i < all.length; i++) {
-    const idx = (probeAccountCursor + i) % all.length;
-    const candidate = all[idx]!;
-    if (!busy.has(candidate.id)) {
-      probeAccountCursor = idx + 1;
-      return candidate.id;
+  const free = all.filter((a) => !busy.has(a.id));
+  const pool = free.length > 0 ? free : all; // every account mid-claim: still probe rather than refuse
+
+  // Primary key: soonest-ready wins. Tie (commonly everyone idle at 0ms)
+  // breaks by round-robin distance from the cursor, so equally-ready
+  // accounts still rotate evenly instead of every probe piling onto
+  // whichever account happens to be first in the list.
+  let bestIdx = 0;
+  let bestReady = readyInMs(pool[0]!.id);
+  let bestDist = (0 - probeAccountCursor + pool.length) % pool.length;
+  for (let i = 1; i < pool.length; i++) {
+    const ready = readyInMs(pool[i]!.id);
+    const dist = (i - probeAccountCursor + pool.length) % pool.length;
+    if (ready < bestReady || (ready === bestReady && dist < bestDist)) {
+      bestIdx = i; bestReady = ready; bestDist = dist;
     }
   }
-  // Every account is mid-claim: still return one rather than refusing to probe at all.
-  const candidate = all[probeAccountCursor % all.length]!;
-  probeAccountCursor++;
-  return candidate.id;
+  probeAccountCursor = bestIdx + 1;
+  return pool[bestIdx]!.id;
 }
 
 export type AccountSelection = "automatic" | string;

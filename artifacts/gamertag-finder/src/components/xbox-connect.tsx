@@ -207,6 +207,27 @@ function AccountCreator({ onConnectNew }: { onConnectNew: () => void }) {
   );
 }
 
+function formatRemaining(ms: number): string {
+  if (ms <= 0) return "clearing…";
+  const totalSeconds = Math.ceil(ms / 1000);
+  const h = Math.floor(totalSeconds / 3600);
+  const m = Math.floor((totalSeconds % 3600) / 60);
+  const s = totalSeconds % 60;
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m ${s}s`;
+  return `${s}s`;
+}
+
+/** Ticks every second so a rate-limited account's badge counts down live between the 10s account-list refetches. */
+function RateLimitCountdown({ until }: { until: number }) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 1_000);
+    return () => clearInterval(t);
+  }, []);
+  return <>{formatRemaining(until - now)}</>;
+}
+
 /**
  * Every signed-in Xbox account, with the ability to switch which one claims
  * run as or forget one — the rest are untouched either way.
@@ -248,7 +269,7 @@ function AccountManager({ onAddAnother }: { onAddAnother: () => void }) {
                       title={a.rateLimitReason ?? "Rate limited"}
                       className="shrink-0 rounded border border-amber-500/40 bg-amber-500/10 px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-wide text-amber-500"
                     >
-                      Rate limited
+                      Rate limited · <RateLimitCountdown until={a.rateLimitedUntil} />
                     </span>
                   )}
                 </p>

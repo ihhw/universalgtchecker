@@ -23,6 +23,7 @@ import { validateXboxGamertag } from "../lib/xbox-validation";
 import { pushActivity } from "../lib/activity";
 import { getWebhookTarget, sendWebhookPayload } from "../lib/webhook-store";
 import { getPublicProxyState, setProxies, clearProxies } from "../lib/xbox-proxy-store";
+import { clearTaken, isRecentlyTaken, markTaken } from "../lib/xbox-checked-cache";
 
 const router: IRouter = Router();
 
@@ -371,6 +372,15 @@ async function runSearch(session: Session): Promise<void> {
 
       rememberTried(gt);
 
+      // A name confirmed taken recently doesn't need re-spending a real
+      // Xbox check — this is what lets looping the same finite space (e.g.
+      // watching the whole 3-character namespace) or re-running overlapping
+      // patterns stay cheap instead of re-learning old news every pass.
+      if (isRecentlyTaken(gt)) {
+        recordResult(gt, "taken", undefined, false);
+        continue;
+      }
+
       const checkStart = Date.now();
 
       // Acquire semaphore slot before making Xbox API call.
@@ -504,6 +514,7 @@ async function runSearch(session: Session): Promise<void> {
           }
           if (session.state === "cancelled") return;
           if (probeResult.status === "available") {
+            clearTaken(gt);
             recordConfirmation(gt, policy);
           } else if (probeResult.status === "rate_limited" || probeResult.status === "error") {
             // Retries exhausted with no real Xbox answer — say so plainly
@@ -526,6 +537,7 @@ async function runSearch(session: Session): Promise<void> {
         })().finally(() => { pendingProbes.delete(task); });
         pendingProbes.add(task);
       } else {
+        if (status === "taken") markTaken(gt);
         const alertable = status === "available" &&
           (!session.runEthanPolicyCheck || policy?.status === "approved");
         recordResult(gt, status, policy, alertable);
