@@ -671,6 +671,18 @@ export async function probeGamertagReservation(
         return { status: "auth_required", httpStatus: rs, message: "Xbox rejected this account's authorization for the reservation probe." };
       }
       if (rs === 409) {
+        // Code 1024 ("Another operation conflicted with your request") is
+        // Xbox reporting a collision -- typically overlapping reserve calls
+        // racing on the same account -- not a real "someone else owns this"
+        // verdict. Treating every 409 as taken was permanently writing off
+        // genuine hits that just happened to land mid-collision. Retry once
+        // before accepting it as a real conflict.
+        let code: number | undefined;
+        try { code = (JSON.parse(reserve.text) as { code?: number }).code; } catch { /* not JSON */ }
+        if (code === 1024 && attempt === 0) {
+          await wait(500, signal);
+          continue;
+        }
         return { status: "taken", httpStatus: rs, message: "Xbox reports this gamertag is taken or reserved by someone else." };
       }
       if (rs === 400) {
