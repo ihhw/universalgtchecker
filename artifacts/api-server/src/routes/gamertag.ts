@@ -399,12 +399,22 @@ async function runSearch(session: Session): Promise<void> {
           // check a moment later can. This only runs on an actual hit, so it
           // costs nothing on the vast majority of checks that come back
           // taken.
-          const reverifySignal = AbortSignal.any([abort.signal, AbortSignal.timeout(5_000)]);
-          let reverify: ResultStatus;
-          try {
-            reverify = await checkGamertag(gt, reverifySignal);
-          } catch {
-            reverify = "error";
+          // A network/timeout error here says nothing about the gamertag
+          // itself — it means the second request never got an answer at
+          // all. Treating it the same as a real "taken"/"unknown" verdict
+          // was throwing away primary's "available" result on a mere
+          // connection hiccup (seen in bursts under load, where several
+          // concurrent reverify requests time out together). Retry a
+          // couple of times before accepting defeat.
+          let reverify: ResultStatus = "error";
+          for (let attempt = 0; attempt < 3; attempt++) {
+            const reverifySignal = AbortSignal.any([abort.signal, AbortSignal.timeout(5_000)]);
+            try {
+              reverify = await checkGamertag(gt, reverifySignal);
+            } catch {
+              reverify = "error";
+            }
+            if (reverify !== "error") break;
           }
           if (reverify !== "available") {
             logCheckerDiagnostic({ gamertag: gt, primary: "available", reverify, outcome: reverify === "taken" ? "taken" : "unknown" });
